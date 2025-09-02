@@ -1,7 +1,6 @@
 """
 Vehicle Data Processor: Convert CARLA data to LSTM-MPC training format
-Supports 3s history -> 5s prediction time window configuration
-Fixed time window alignment issue
+Modified to save all pkl files to a folder
 """
 
 import pandas as pd
@@ -147,11 +146,15 @@ class VehicleDataProcessor:
         
         return sequences
     
-    def process_carla_data(self, data_root, output_path=None, max_episodes=None):
-        """Process CARLA dataset"""
+    def process_carla_data(self, data_root, output_folder='vehicle_datasets', max_episodes=None):
+        """Process CARLA dataset and save to folder"""
         
-        if output_path is None:
-            output_path = 'vehicle_lstm_dataset.pkl'
+        # Create output folder if it doesn't exist
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"Output folder: {output_folder}")
+        
+        # Define output path for complete dataset
+        output_path = os.path.join(output_folder, 'vehicle_lstm_dataset.pkl')
         
         # Find all episode directories
         episode_dirs = []
@@ -217,7 +220,7 @@ class VehicleDataProcessor:
             }
         }
         
-        # Save dataset
+        # Save dataset to folder
         with open(output_path, 'wb') as f:
             pickle.dump(dataset, f)
         
@@ -226,7 +229,7 @@ class VehicleDataProcessor:
         # Print statistics
         self.print_dataset_statistics(dataset)
         
-        return dataset
+        return dataset, output_folder  # Return both dataset and folder path
     
     def print_dataset_statistics(self, dataset):
         """Print dataset statistics"""
@@ -274,16 +277,19 @@ class VehicleDataProcessor:
             current_matches_history = np.allclose(seq['current_state'], seq['hist_states'][-1])
             print(f"  Current state matches last history state: {current_matches_history}")
     
-    def create_train_test_split(self, dataset_path, train_ratio=0.8, 
-                            train_output='vehicle_train_dataset.pkl',
-                            test_output='vehicle_test_dataset.pkl'):
-        """Create train/test dataset split"""
+    def create_train_test_split(self, dataset_path, output_folder, train_ratio=0.8):
+        """Create train/test dataset split and save to folder"""
         
+        # Load dataset
         with open(dataset_path, 'rb') as f:
             dataset = pickle.load(f)
         
         sequences = dataset['training_sequences']
         episodes = dataset['episode_info']
+        
+        # Define output paths in the same folder
+        train_output = os.path.join(output_folder, 'vehicle_train_dataset.pkl')
+        test_output = os.path.join(output_folder, 'vehicle_test_dataset.pkl')
         
         # Split by episode to ensure same episode data doesn't appear in both train and test sets
         np.random.seed(42)
@@ -326,7 +332,7 @@ class VehicleDataProcessor:
             'config': dataset['config']
         }
         
-        # Save datasets
+        # Save datasets to folder
         with open(train_output, 'wb') as f:
             pickle.dump(train_dataset, f)
         
@@ -407,7 +413,7 @@ def main():
     """Data processing main function"""
     parser = argparse.ArgumentParser(description='CARLA vehicle data processing')
     parser.add_argument('--data_root', default='collected_data', help='CARLA data root directory')
-    parser.add_argument('--output', default='vehicle_lstm_dataset.pkl', help='Output dataset path')
+    parser.add_argument('--output_folder', default='vehicle_datasets', help='Output folder for all pkl files')
     parser.add_argument('--max_episodes', type=int, default=None, help='Maximum episodes to process')
     parser.add_argument('--sampling_freq', type=float, default=20.0, help='Sampling frequency (Hz)')
     parser.add_argument('--history_time', type=float, default=3.0, help='History time window (seconds)')
@@ -419,7 +425,7 @@ def main():
     
     print("=== CARLA Vehicle Data Processing Tool ===")
     print(f"Data root directory: {args.data_root}")
-    print(f"Output path: {args.output}")
+    print(f"Output folder: {args.output_folder}")
     
     # Create data processor
     processor = VehicleDataProcessor(
@@ -428,21 +434,27 @@ def main():
         predict_time=args.predict_time
     )
     
-    # Process data
-    dataset = processor.process_carla_data(
+    # Process data and save to folder
+    dataset, output_folder = processor.process_carla_data(
         data_root=args.data_root,
-        output_path=args.output,
+        output_folder=args.output_folder,
         max_episodes=args.max_episodes
     )
     
     # Create train/test split
     if args.create_split and dataset:
+        dataset_path = os.path.join(output_folder, 'vehicle_lstm_dataset.pkl')
         processor.create_train_test_split(
-            dataset_path=args.output,
+            dataset_path=dataset_path,
+            output_folder=output_folder,
             train_ratio=args.train_ratio
         )
     
-    print("\nData processing completed!")
+    print(f"\nData processing completed!")
+    print(f"All files saved to folder: {output_folder}/")
+    print(f"  - vehicle_lstm_dataset.pkl (complete dataset)")
+    print(f"  - vehicle_train_dataset.pkl (training set)")
+    print(f"  - vehicle_test_dataset.pkl (test set)")
 
 if __name__ == "__main__":
     main()

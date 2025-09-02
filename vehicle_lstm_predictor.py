@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 import pickle
 import argparse
 from tqdm import tqdm
+import os
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -80,7 +81,7 @@ class VehicleLSTM(nn.Module):
         return predicted_states, predicted_controls
     
     def decode(self, context):
-        # 将context扩展到所有预测时间步
+        # Expand context to all prediction timesteps
         decoder_input = context.unsqueeze(1).repeat(1, self.predict_steps, 1)
         
         h_dec, _ = self.decoder_lstm(decoder_input)
@@ -114,11 +115,15 @@ class TrajectoryLoss(nn.Module):
         return total_loss
 
 class VehicleLSTMTrainer:
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', save_dir='models'):
         self.model = model.to(device)
         self.device = device
         self.train_losses = []
         self.val_losses = []
+        self.save_dir = save_dir
+        
+        # Create model save directory
+        os.makedirs(save_dir, exist_ok=True)
         
     def train_model(self, train_loader, val_loader, epochs=100, lr=1e-3, patience=15):
         criterion = TrajectoryLoss()
@@ -130,6 +135,7 @@ class VehicleLSTMTrainer:
         
         print(f"Training on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Model will be saved to: {self.save_dir}")
         
         for epoch in range(epochs):
             self.model.train()
@@ -179,6 +185,9 @@ class VehicleLSTMTrainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
+                
+                # Save best model to specified directory
+                model_path = os.path.join(self.save_dir, 'best_vehicle_lstm.pth')
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -193,7 +202,8 @@ class VehicleLSTMTrainer:
                     'val_loss': val_loss,
                     'train_losses': self.train_losses,
                     'val_losses': self.val_losses
-                }, 'best_vehicle_lstm.pth')
+                }, model_path)
+                print(f"  ✓ Best model saved to {model_path}")
             else:
                 patience_counter += 1
                 
@@ -233,6 +243,11 @@ class VehicleLSTMTrainer:
 class VehiclePredictor:
     def __init__(self, model_path, device='cpu'):
         self.device = device
+        
+        # Check if model file exists
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+            
         checkpoint = torch.load(model_path, map_location=device)
         
         if 'model_config' in checkpoint:
@@ -337,39 +352,27 @@ class VehiclePredictor:
         plt.show()
 
 def calculate_temporal_errors(pred_states, true_states, time_step=0.05):
-    """
-    计算未来不同时刻的平均误差
-    
-    Args:
-        pred_states: 预测状态 [N, T, 4] (x, y, yaw, speed)
-        true_states: 真实状态 [N, T, 4]
-        time_step: 时间步长（秒）
-    
-    Returns:
-        dict: 包含不同时刻误差的字典
-    """
-    # 时间点对应的索引 (1s=20steps, 2s=40steps, etc.)
-    time_points = [1, 2, 3, 4, 5]  # 秒
-    time_indices = [int(t / time_step) - 1 for t in time_points]  # 转换为索引 (19, 39, 59, 79, 99)
+    """Calculate average errors at different future time points"""
+    time_points = [1, 2, 3, 4, 5]  # seconds
+    time_indices = [int(t / time_step) - 1 for t in time_points]  # convert to indices
     
     error_results = {}
     
     for i, (t, idx) in enumerate(zip(time_points, time_indices)):
-        if idx >= pred_states.shape[1]:  # 确保索引不越界
+        if idx >= pred_states.shape[1]:
             continue
             
-        # 位置误差 (欧几里得距离)
+        # 位置误差
         position_error = np.sqrt(
             (pred_states[:, idx, 0] - true_states[:, idx, 0])**2 + 
             (pred_states[:, idx, 1] - true_states[:, idx, 1])**2
         )
         
-        # 速度误差 (绝对差值，转换为km/h)
+        # 速度误差
         speed_error = np.abs(pred_states[:, idx, 3] - true_states[:, idx, 3]) * 3.6
         
-        # 朝向角误差 (角度差，转换为度)
+        # 朝向角误差
         yaw_error = np.abs(pred_states[:, idx, 2] - true_states[:, idx, 2])
-        # 处理角度环绕问题
         yaw_error = np.minimum(yaw_error, 2*np.pi - yaw_error)
         yaw_error = np.rad2deg(yaw_error)
         
@@ -389,16 +392,13 @@ def calculate_temporal_errors(pred_states, true_states, time_step=0.05):
     return error_results
 
 def evaluate_full_dataset(predictor, test_dataset_full, scalers, device='cpu'):
-    """
-    评估整个测试数据集并计算时间误差统计
-    """
+    """Evaluate entire test dataset and compute temporal error statistics"""
     print("Starting full dataset evaluation...")
     print(f"Total test sequences: {len(test_dataset_full['training_sequences'])}")
     
     all_pred_states = []
     all_true_states = []
     
-    # 处理所有测试序列
     for i, seq in enumerate(tqdm(test_dataset_full['training_sequences'], desc="Processing sequences")):
         try:
             pred_states, pred_controls = predictor.predict_trajectory(
@@ -417,21 +417,17 @@ def evaluate_full_dataset(predictor, test_dataset_full, scalers, device='cpu'):
         print("No valid predictions generated!")
         return None
     
-    # 转换为numpy数组
-    all_pred_states = np.array(all_pred_states)  # [N, T, 4]
-    all_true_states = np.array(all_true_states)  # [N, T, 4]
+    all_pred_states = np.array(all_pred_states)
+    all_true_states = np.array(all_true_states)
     
     print(f"Successfully processed {len(all_pred_states)} sequences")
     
-    # 计算时间误差统计
     temporal_errors = calculate_temporal_errors(all_pred_states, all_true_states)
     
     return temporal_errors
 
 def print_error_statistics(error_results):
-    """
-    打印误差统计结果
-    """
+    """Print error statistics results"""
     print("\n" + "="*80)
     print("TEMPORAL ERROR ANALYSIS RESULTS")
     print("="*80)
@@ -462,13 +458,9 @@ def print_error_statistics(error_results):
               f"{sample_count:<8}")
     
     print("="*80)
-    print("Legend: Position Error in meters, Speed Error in km/h, Yaw Error in degrees")
-    print("Format: Mean±StandardDeviation (Maximum)")
 
 def plot_error_trends(error_results):
-    """
-    绘制误差随时间变化的趋势图
-    """
+    """Plot error trends over time"""
     time_points = [1, 2, 3, 4, 5]
     pos_means = [error_results[f'{t}s']['position_error_mean'] for t in time_points]
     speed_means = [error_results[f'{t}s']['speed_error_mean'] for t in time_points]
@@ -480,7 +472,7 @@ def plot_error_trends(error_results):
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    # 位置误差
+    # Position error
     ax = axes[0]
     ax.errorbar(time_points, pos_means, yerr=pos_stds, marker='o', capsize=5, capthick=2)
     ax.set_xlabel('Time (s)')
@@ -488,7 +480,7 @@ def plot_error_trends(error_results):
     ax.set_title('Position Error vs Time')
     ax.grid(True, alpha=0.3)
     
-    # 速度误差
+    # Speed error
     ax = axes[1]
     ax.errorbar(time_points, speed_means, yerr=speed_stds, marker='s', capsize=5, capthick=2, color='orange')
     ax.set_xlabel('Time (s)')
@@ -496,7 +488,7 @@ def plot_error_trends(error_results):
     ax.set_title('Speed Error vs Time')
     ax.grid(True, alpha=0.3)
     
-    # 朝向角误差
+    # Yaw error
     ax = axes[2]
     ax.errorbar(time_points, yaw_means, yerr=yaw_stds, marker='^', capsize=5, capthick=2, color='green')
     ax.set_xlabel('Time (s)')
@@ -507,33 +499,63 @@ def plot_error_trends(error_results):
     plt.tight_layout()
     plt.show()
 
-def load_dataset(dataset_path):
+def load_dataset_from_folder(data_folder, dataset_name):
+    """Load dataset from specified folder"""
+    dataset_path = os.path.join(data_folder, dataset_name)
+    
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+    
     with open(dataset_path, 'rb') as f:
         dataset = pickle.load(f)
     
     print(f"Dataset loaded: {dataset_path}")
-    print(f"Sequences: {len(dataset['training_sequences'])}")
-    print(f"Configuration: {dataset['config']}")
+    print(f"  Sequences: {len(dataset['training_sequences'])}")
+    if 'config' in dataset:
+        print(f"  Configuration: {dataset['config']}")
     
     return dataset
 
 def main():
     parser = argparse.ArgumentParser(description='Vehicle LSTM Trajectory Prediction')
-    parser.add_argument('--train_data', default='vehicle_train_dataset.pkl', help='Training dataset path')
-    parser.add_argument('--test_data', default='vehicle_test_dataset.pkl', help='Test dataset path')
+    
+    # Data folder parameters
+    parser.add_argument('--data_folder', default='vehicle_datasets', help='Folder containing all datasets')
+    
+    # Dataset filename parameters (optional for custom filenames)
+    parser.add_argument('--train_file', default='vehicle_train_dataset.pkl', help='Training dataset filename')
+    parser.add_argument('--test_file', default='vehicle_test_dataset.pkl', help='Test dataset filename')
+    
+    # Model save directory
+    parser.add_argument('--save_dir', default='models', help='Directory to save models and scalers')
+    
+    # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
     parser.add_argument('--batch_size', type=int, default=1280, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--hidden_dim', type=int, default=32, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='LSTM layers')
-    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='evaluate', help='Mode: train, test, predict, or evaluate')
+    
+    # Run mode
+    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='train', 
+                       help='Mode: train, test, predict, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
     args = parser.parse_args()
     
+    # Create necessary directories
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    print(f"=== Vehicle LSTM Trajectory Prediction ===")
+    print(f"Data folder: {args.data_folder}")
+    print(f"Model save directory: {args.save_dir}")
+    print(f"Mode: {args.mode}")
+    print("-" * 50)
+    
     if args.mode == 'train':
-        train_dataset_full = load_dataset(args.train_data)
-        val_dataset_full = load_dataset(args.test_data)
+        # Load training and validation datasets
+        train_dataset_full = load_dataset_from_folder(args.data_folder, args.train_file)
+        val_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
         train_dataset = VehicleDataset(train_dataset_full['training_sequences'])
         val_dataset = VehicleDataset(val_dataset_full['training_sequences'], 
@@ -541,23 +563,29 @@ def main():
                                    train_dataset.scaler_controls, 
                                    is_train=False)
         
-        with open('scalers.pkl', 'wb') as f:
+        # Save scalers to model directory
+        scalers_path = os.path.join(args.save_dir, 'scalers.pkl')
+        with open(scalers_path, 'wb') as f:
             pickle.dump({
                 'scaler_states': train_dataset.scaler_states,
                 'scaler_controls': train_dataset.scaler_controls
             }, f)
+        print(f"Scalers saved to: {scalers_path}")
         
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
         
         model = VehicleLSTM(hidden_dim=args.hidden_dim, num_layers=args.num_layers)
-        trainer = VehicleLSTMTrainer(model)
+        trainer = VehicleLSTMTrainer(model, save_dir=args.save_dir)
         trainer.train_model(train_loader, val_loader, epochs=args.epochs, lr=args.lr)
         
     elif args.mode == 'test':
-        test_dataset_full = load_dataset(args.test_data)
+        # Load test dataset
+        test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
-        with open('scalers.pkl', 'rb') as f:
+        # Load scalers
+        scalers_path = os.path.join(args.save_dir, 'scalers.pkl')
+        with open(scalers_path, 'rb') as f:
             scalers = pickle.load(f)
 
         sample_start = 500
@@ -569,7 +597,10 @@ def main():
                                     is_train=False)
         
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-        predictor = VehiclePredictor('best_vehicle_lstm.pth')
+        
+        # Load model
+        model_path = os.path.join(args.save_dir, 'best_vehicle_lstm.pth')
+        predictor = VehiclePredictor(model_path)
         
         for i, batch in enumerate(test_loader):
             if i >= 10:
@@ -584,35 +615,52 @@ def main():
             predictor.visualize_prediction(seq['hist_states'], pred_states, seq['future_states'])
     
     elif args.mode == 'evaluate':
-        # 新增的完整评估模式
         print("Loading test dataset and model...")
-        test_dataset_full = load_dataset(args.test_data)
         
-        with open('scalers.pkl', 'rb') as f:
+        # Load test dataset
+        test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
+        
+        # Load scalers
+        scalers_path = os.path.join(args.save_dir, 'scalers.pkl')
+        if not os.path.exists(scalers_path):
+            print(f"Error: Scalers not found at {scalers_path}")
+            print("Please train the model first to generate scalers.")
+            return
+            
+        with open(scalers_path, 'rb') as f:
             scalers = pickle.load(f)
         
-        predictor = VehiclePredictor('best_vehicle_lstm.pth')
+        # Load model
+        model_path = os.path.join(args.save_dir, 'best_vehicle_lstm.pth')
+        if not os.path.exists(model_path):
+            print(f"Error: Model not found at {model_path}")
+            print("Please train the model first.")
+            return
+            
+        predictor = VehiclePredictor(model_path)
         
-        # 评估整个测试数据集
+        # Evaluate entire test dataset
         error_results = evaluate_full_dataset(predictor, test_dataset_full, scalers)
         
         if error_results:
-            # 打印结果
+            # Print results
             print_error_statistics(error_results)
             
-            # 绘制趋势图
+            # Plot trends
             plot_error_trends(error_results)
             
-            # 保存结果（可选）
+            # Save results (optional)
             if args.save_results:
-                with open('temporal_error_results.pkl', 'wb') as f:
+                results_path = os.path.join(args.save_dir, 'temporal_error_results.pkl')
+                with open(results_path, 'wb') as f:
                     pickle.dump(error_results, f)
-                print("Results saved to 'temporal_error_results.pkl'")
+                print(f"Results saved to: {results_path}")
         else:
             print("Evaluation failed!")
     
     elif args.mode == 'predict':
         print("Interactive prediction mode")
+        print("Not implemented yet. Use 'test' mode for visualization.")
 
 if __name__ == "__main__":
     main()
