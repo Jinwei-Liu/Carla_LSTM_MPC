@@ -27,8 +27,8 @@ SAVE_CAMERA_H5 = False   # 是否保存 cameras.h5 文件
 
 # 多相机配置
 DISPLAY_CONFIG = {
-    'width': 1280,
-    'height': 720,
+    'width': 1280*1.5,
+    'height': 720*1.5,
     # 左右后视镜显示区域配置（删除后视镜）
     'mirror_config': {
         'left_mirror': {
@@ -37,7 +37,7 @@ DISPLAY_CONFIG = {
         },
         'right_mirror': {
             'size': (160, 120), 
-            'position': (1110, 10)  # 右上角
+            'position': (1700, 10)  # 右上角
         }
         # 删除了 rear_mirror 配置
     }
@@ -47,8 +47,8 @@ DISPLAY_CONFIG = {
 SENSORS = {
     # 主驾驶员相机
     'main_camera': {
-        'width': 1280,
-        'height': 720,
+        'width': 1280*1.5,
+        'height': 720*1.5,
         'fov': 90,
         'position': (1.6, 0.0, 1.7),
         'rotation': (0, 0, 0)

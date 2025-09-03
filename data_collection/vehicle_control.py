@@ -49,6 +49,9 @@ class WheelControl:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 20)
         
+        # 为速度显示创建大字体
+        self.speed_font = pygame.font.Font(None, 72)  # 大字体用于速度显示
+        
         # 初始化多相机管理器
         print("Setting up cameras and mirrors...")
         self.camera_manager = CameraManager(world, vehicle)
@@ -60,6 +63,7 @@ class WheelControl:
         print("  - 主视角：全屏驾驶员视角")
         print("  - 左后视镜：左上角")
         print("  - 右后视镜：右上角")
+        print("  - 速度显示：界面顶部中央（大红字）")
         print("  注意：已移除后视镜显示")
         print("控制说明：")
         print("  - 方向盘: 转向")
@@ -188,9 +192,26 @@ handbrake = 0
         speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         transform = self.vehicle.get_transform()
         
-        # HUD信息
+        # ===== 在顶部中央显示大红字速度 =====
+        speed_text = f"{speed:.0f} km/h"
+        speed_surface = self.speed_font.render(speed_text, True, (255, 0, 0))  # 大红字
+        
+        # 计算居中位置
+        speed_width = speed_surface.get_width()
+        speed_x = (self.screen.get_width() - speed_width) // 2
+        speed_y = 20  # 距离顶部20像素
+        
+        # 添加半透明黑色背景让速度更易读
+        bg_padding = 10
+        speed_bg = pygame.Surface((speed_width + bg_padding*2, speed_surface.get_height() + bg_padding))
+        speed_bg.set_alpha(120)
+        speed_bg.fill((0, 0, 0))
+        
+        self.screen.blit(speed_bg, (speed_x - bg_padding, speed_y - bg_padding//2))
+        self.screen.blit(speed_surface, (speed_x, speed_y))
+        
+        # ===== 其他HUD信息（不包含速度） =====
         info_lines = [
-            f"Speed: {speed:.1f} km/h",
             f"Throttle: {self._control.throttle:.2f}",
             f"Brake: {self._control.brake:.2f}", 
             f"Steer: {self._control.steer:.2f}",
@@ -232,13 +253,6 @@ handbrake = 0
             self.screen.get_height() - 25
         ))
         
-        # 显示镜像标识（删除后视镜说明）
-        mirror_info = self.font.render("Mirrors: L=Left, R=Right (Rear mirror removed)", True, (200, 200, 200))
-        mirror_width = mirror_info.get_width()
-        self.screen.blit(mirror_info, (
-            (self.screen.get_width() - mirror_width) // 2,
-            145  # 在后视镜下方位置
-        ))
     
     def get_control_data(self):
         """获取控制数据"""
