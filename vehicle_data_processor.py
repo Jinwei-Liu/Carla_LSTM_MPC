@@ -1,6 +1,6 @@
 """
 Vehicle Data Processor: Convert CARLA data to LSTM-MPC training format
-Modified to save all pkl files to a folder
+Modified to save all pkl files to a folder and use relative coordinate system
 """
 
 import pandas as pd
@@ -13,7 +13,7 @@ import argparse
 from tqdm import tqdm
 
 class VehicleDataProcessor:
-    """Vehicle trajectory data processor"""
+    """Vehicle trajectory data processor with relative coordinate system"""
     
     def __init__(self, sampling_freq=20.0, history_time=3.0, predict_time=5.0):
         """
@@ -34,6 +34,51 @@ class VehicleDataProcessor:
         print(f"  Sampling freq: {sampling_freq} Hz")
         print(f"  History window: {history_time}s + current ({self.history_steps} steps total)")
         print(f"  Prediction window: {predict_time}s ({self.predict_steps} steps)")
+        print(f"  Using relative coordinate system (current state as origin)")
+    
+    def normalize_angle(self, angle):
+        """将角度归一化到 [-pi, pi]"""
+        return np.arctan2(np.sin(angle), np.cos(angle))
+    
+    def transform_to_coordinates(self, states, current_state):
+        """
+        将状态转换为以current_state为原点的相对坐标系
+        Args:
+            states: (N, 4) array [x, y, yaw, speed]  
+            current_state: (4,) array [x_current, y_current, yaw_current, speed_current]
+        Returns:
+            relative_states: (N, 4) array in relative coordinate system
+        """
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+            
+        relative_states = states.copy()
+        
+        # 提取当前状态
+        x_current, y_current, yaw_current, speed_current = current_state
+        
+        # 1. 平移：将当前位置设为原点
+        relative_states[:, 0] = states[:, 0] - x_current  # x' = x - x_current
+        relative_states[:, 1] = states[:, 1] - y_current  # y' = y - y_current
+        
+        # 2. 旋转：将当前朝向设为0度方向
+        cos_yaw = np.cos(-yaw_current)
+        sin_yaw = np.sin(-yaw_current)
+        
+        x_translated = relative_states[:, 0]
+        y_translated = relative_states[:, 1]
+        
+        # 旋转变换
+        relative_states[:, 0] = x_translated * cos_yaw - y_translated * sin_yaw
+        relative_states[:, 1] = x_translated * sin_yaw + y_translated * cos_yaw
+        
+        # 3. 角度变换：相对于当前朝向
+        relative_states[:, 2] = self.normalize_angle(states[:, 2] - yaw_current)
+        
+        # 4. 速度保持不变
+        relative_states[:, 3] = states[:, 3]
+        
+        return relative_states
     
     def load_carla_episode(self, episode_path):
         """Load single CARLA episode data"""
@@ -74,7 +119,7 @@ class VehicleDataProcessor:
         return controls
     
     def create_training_sequences(self, states, controls):
-        """Create training sequences from trajectory data"""
+        """Create training sequences from trajectory data with relative coordinate system"""
         sequences = []
         total_steps = len(states)
         
@@ -87,34 +132,49 @@ class VehicleDataProcessor:
         
         # Extract sequences with sliding window
         for i in range(total_steps - min_length + 1):
-            # Time alignment:
-            # - Historical states: [i, i+history_steps)     -> past 3s + current (61 steps, t=-3s to t=0s)
-            # - Current state: i+history_steps-1            -> t=0 (last step of history)
-            # - Future states: [i+history_steps, i+history_steps+predict_steps) -> future 5s (100 steps, t=0.05s to t=5s)
-            
             current_idx = i + self.history_steps - 1  # 当前状态的索引
             
-            # Historical sequences (input) - past 3s + current moment (包含当前状态)
-            hist_states = states[i:i+self.history_steps]                    # (61, 4)
-            hist_controls = controls[i:i+self.history_steps]                # (61, 3)
+            # 原始数据序列
+            hist_states_raw = states[i:i+self.history_steps]                    # (61, 4)
+            hist_controls_raw = controls[i:i+self.history_steps]                # (61, 3)
+            current_state_raw = states[current_idx]                             # (4,)
+            current_control_raw = controls[current_idx]                         # (3,)
+            future_states_raw = states[i+self.history_steps:i+self.history_steps+self.predict_steps]   # (100, 4)
+            future_controls_raw = controls[i+self.history_steps:i+self.history_steps+self.predict_steps] # (100, 3)
             
-            # Current state (MPC initial state) - t=0 (历史状态的最后一个)
-            current_state = states[current_idx]                             # (4,)
-            current_control = controls[current_idx]                         # (3,)
+            # === 坐标系变换：以当前状态为原点 ===
+            # 变换历史状态
+            hist_states = self.transform_to_coordinates(hist_states_raw, current_state_raw)
             
-            # Future ground truth trajectory (target) - future 5 seconds
-            future_states = states[i+self.history_steps:i+self.history_steps+self.predict_steps]   # (100, 4)
-            future_controls = controls[i+self.history_steps:i+self.history_steps+self.predict_steps] # (100, 3)
+            # 变换未来状态
+            future_states = self.transform_to_coordinates(future_states_raw, current_state_raw)
+            
+            # 当前状态在相对坐标系中应该是 [0, 0, 0, speed]
+            current_state = np.array([0.0, 0.0, 0.0, current_state_raw[3]])
+            
+            # 控制量不需要变换
+            hist_controls = hist_controls_raw
+            current_control = current_control_raw  
+            future_controls = future_controls_raw
+            
+            # 验证变换正确性：hist_states的最后一个状态应该接近 [0, 0, 0, speed]
+            last_hist_state = hist_states[-1]
+            assert abs(last_hist_state[0]) < 1e-10, f"x coordinate not zero: {last_hist_state[0]}"
+            assert abs(last_hist_state[1]) < 1e-10, f"y coordinate not zero: {last_hist_state[1]}"  
+            assert abs(last_hist_state[2]) < 1e-10, f"yaw angle not zero: {last_hist_state[2]}"
             
             sequence = {
-                'hist_states': hist_states,           # Past 3s + current: (61, 4)
+                'hist_states': hist_states,           # Past 3s + current in relative coords: (61, 4)
                 'hist_controls': hist_controls,       # Past 3s + current: (61, 3)  
-                'current_state': current_state,       # t=0: (4,) - same as hist_states[-1]
-                'current_control': current_control,   # t=0: (3,) - same as hist_controls[-1]
-                'future_states': future_states,       # Future 5s: (100, 4)
+                'current_state': current_state,       # [0, 0, 0, speed]: (4,)
+                'current_control': current_control,   # t=0: (3,)
+                'future_states': future_states,       # Future 5s in relative coords: (100, 4)
                 'future_controls': future_controls,   # Future 5s: (100, 3)
                 'sequence_id': i,
-                'current_idx': current_idx            # For debugging
+                'current_idx': current_idx,           # For debugging
+                # 保留原始数据用于调试
+                'raw_current_state': current_state_raw,  # 原始当前状态
+                'raw_current_position': current_state_raw[:3]  # [x, y, yaw] 用于逆变换
             }
             
             sequences.append(sequence)
@@ -141,7 +201,7 @@ class VehicleDataProcessor:
         states = self.extract_vehicle_states(df)
         controls = self.extract_vehicle_controls(df)
         
-        # 3. Create training sequences
+        # 3. Create training sequences with relative coordinate transformation
         sequences = self.create_training_sequences(states, controls)
         
         return sequences
@@ -216,7 +276,9 @@ class VehicleDataProcessor:
                 'predict_steps': self.predict_steps,
                 'state_dim': 4,    # [x, y, yaw, speed]
                 'control_dim': 3,  # [throttle, brake, steer]
-                'min_sequence_length': self.history_steps + self.predict_steps
+                'min_sequence_length': self.history_steps + self.predict_steps,
+                'coordinate_system': 'relative',  # 新增：标记使用相对坐标系
+                'relative_origin': 'current_state'  # 新增：以当前状态为原点
             }
         }
         
@@ -237,7 +299,7 @@ class VehicleDataProcessor:
         episodes = dataset['episode_info']
         config = dataset['config']
         
-        print(f"\n=== Dataset Statistics ===")
+        print(f"\n=== Dataset Statistics (Relative Coordinate System) ===")
         print(f"Configuration:")
         print(f"  Sampling freq: {config['sampling_freq']} Hz")
         print(f"  History window: {config['history_time']}s + current ({config['history_steps']} steps total)")
@@ -245,22 +307,43 @@ class VehicleDataProcessor:
         print(f"  Minimum sequence length: {config['min_sequence_length']} steps")
         print(f"  State dimension: {config['state_dim']}")
         print(f"  Control dimension: {config['control_dim']}")
+        print(f"  Coordinate system: {config.get('coordinate_system', 'absolute')} (origin: {config.get('relative_origin', 'N/A')})")
         
         print(f"\nData statistics:")
         print(f"  Number of episodes: {len(episodes)}")
         print(f"  Number of training sequences: {len(sequences)}")
         print(f"  Average sequences per episode: {np.mean([ep['num_sequences'] for ep in episodes]):.1f}")
         
-        # Analyze state distribution
+        # Analyze state distribution in relative coordinate system
         if sequences:
-            all_states = np.array([seq['current_state'] for seq in sequences])
-            all_speeds = all_states[:, 3] * 3.6  # Convert to km/h
+            # 当前状态分布（应该都是[0,0,0,speed]）
+            all_current_states = np.array([seq['current_state'] for seq in sequences])
+            print(f"\nCurrent state verification (should be [0,0,0,speed]):")
+            print(f"  X: min={np.min(all_current_states[:, 0]):.6f}, max={np.max(all_current_states[:, 0]):.6f}")
+            print(f"  Y: min={np.min(all_current_states[:, 1]):.6f}, max={np.max(all_current_states[:, 1]):.6f}")
+            print(f"  Yaw: min={np.min(all_current_states[:, 2]):.6f}, max={np.max(all_current_states[:, 2]):.6f}")
+            print(f"  Speed: avg={np.mean(all_current_states[:, 3])*3.6:.1f} km/h, max={np.max(all_current_states[:, 3])*3.6:.1f} km/h")
             
-            print(f"\nState distribution:")
-            print(f"  X coordinate range: [{np.min(all_states[:, 0]):.1f}, {np.max(all_states[:, 0]):.1f}]")
-            print(f"  Y coordinate range: [{np.min(all_states[:, 1]):.1f}, {np.max(all_states[:, 1]):.1f}]")
-            print(f"  Yaw angle range: [{np.min(all_states[:, 2]):.2f}, {np.max(all_states[:, 2]):.2f}] rad")
-            print(f"  Speed stats: avg {np.mean(all_speeds):.1f} km/h, max {np.max(all_speeds):.1f} km/h")
+            # 历史状态分布（相对坐标系）
+            all_hist_states = np.concatenate([seq['hist_states'] for seq in sequences[:100]], axis=0)  # 只取前100个样本避免内存问题
+            print(f"\nHistorical states distribution (relative coordinates, sample from first 100 sequences):")
+            print(f"  X range: [{np.min(all_hist_states[:, 0]):.1f}, {np.max(all_hist_states[:, 0]):.1f}] m")
+            print(f"  Y range: [{np.min(all_hist_states[:, 1]):.1f}, {np.max(all_hist_states[:, 1]):.1f}] m")
+            print(f"  Yaw range: [{np.min(all_hist_states[:, 2]):.2f}, {np.max(all_hist_states[:, 2]):.2f}] rad")
+            
+            # 未来状态分布（相对坐标系）
+            all_future_states = np.concatenate([seq['future_states'] for seq in sequences[:100]], axis=0)
+            print(f"\nFuture states distribution (relative coordinates, sample from first 100 sequences):")
+            print(f"  X range: [{np.min(all_future_states[:, 0]):.1f}, {np.max(all_future_states[:, 0]):.1f}] m")
+            print(f"  Y range: [{np.min(all_future_states[:, 1]):.1f}, {np.max(all_future_states[:, 1]):.1f}] m")
+            print(f"  Yaw range: [{np.min(all_future_states[:, 2]):.2f}, {np.max(all_future_states[:, 2]):.2f}] rad")
+            
+            # 原始当前位置分布（用于了解数据覆盖范围）
+            all_raw_positions = np.array([seq['raw_current_position'] for seq in sequences])
+            print(f"\nOriginal position distribution (for reference):")
+            print(f"  X coordinate range: [{np.min(all_raw_positions[:, 0]):.1f}, {np.max(all_raw_positions[:, 0]):.1f}] m")
+            print(f"  Y coordinate range: [{np.min(all_raw_positions[:, 1]):.1f}, {np.max(all_raw_positions[:, 1]):.1f}] m")
+            print(f"  Yaw angle range: [{np.min(all_raw_positions[:, 2]):.2f}, {np.max(all_raw_positions[:, 2]):.2f}] rad")
             
         # Verify sequence structure
         if sequences:
@@ -273,9 +356,16 @@ class VehicleDataProcessor:
             print(f"  future_states shape: {seq['future_states'].shape}")
             print(f"  future_controls shape: {seq['future_controls'].shape}")
             
-            # Verify that current_state is the same as the last element of hist_states
-            current_matches_history = np.allclose(seq['current_state'], seq['hist_states'][-1])
-            print(f"  Current state matches last history state: {current_matches_history}")
+            # 验证当前状态是否为[0,0,0,speed]
+            current_state = seq['current_state']
+            is_origin = np.allclose(current_state[:3], [0, 0, 0], atol=1e-10)
+            print(f"  Current state is at origin [0,0,0]: {is_origin}")
+            print(f"  Current state: [{current_state[0]:.6f}, {current_state[1]:.6f}, {current_state[2]:.6f}, {current_state[3]:.3f}]")
+            
+            # 验证hist_states最后一个元素是否也是[0,0,0,speed]
+            last_hist_state = seq['hist_states'][-1]
+            hist_matches_current = np.allclose(last_hist_state, current_state, atol=1e-10)
+            print(f"  Last history state matches current state: {hist_matches_current}")
     
     def create_train_test_split(self, dataset_path, output_folder, train_ratio=0.8):
         """Create train/test dataset split and save to folder"""
@@ -343,75 +433,11 @@ class VehicleDataProcessor:
         print(f"Training set: {len(train_sequences)} sequences, {len(train_episodes)} episodes -> {train_output}")
         print(f"Test set: {len(test_sequences)} sequences, {len(test_episodes)} episodes -> {test_output}")
         
-        # === 新增：详细显示episode分配情况 ===
-        print(f"\n=== Episode Assignment Details ===")
-        print(f"Split ratio: {train_ratio:.1%} train / {1-train_ratio:.1%} test")
-        print(f"Random seed: 42")
-        
-        # 按session分组显示
-        from collections import defaultdict
-        train_by_session = defaultdict(list)
-        test_by_session = defaultdict(list)
-        
-        # 收集训练集episode信息
-        for episode in train_episodes:
-            session_name = episode['session_name']
-            episode_name = episode['episode_name']
-            num_seq = episode['num_sequences']
-            train_by_session[session_name].append((episode_name, num_seq))
-        
-        # 收集测试集episode信息  
-        for episode in test_episodes:
-            session_name = episode['session_name']
-            episode_name = episode['episode_name']
-            num_seq = episode['num_sequences']
-            test_by_session[session_name].append((episode_name, num_seq))
-        
-        # 显示训练集
-        print(f"\nTRAINING SET ({len(train_episodes)} episodes):")
-        train_total_sequences = 0
-        for session_name in sorted(train_by_session.keys()):
-            episodes_info = train_by_session[session_name]
-            session_sequences = sum(num_seq for _, num_seq in episodes_info)
-            train_total_sequences += session_sequences
-            
-            print(f"  Session: {session_name} ({len(episodes_info)} episodes, {session_sequences} sequences)")
-            for episode_name, num_seq in sorted(episodes_info):
-                print(f"    - {episode_name}: {num_seq} sequences")
-        
-        print(f"  Training total: {train_total_sequences} sequences")
-        
-        # 显示测试集
-        print(f"\nTEST SET ({len(test_episodes)} episodes):")
-        test_total_sequences = 0
-        for session_name in sorted(test_by_session.keys()):
-            episodes_info = test_by_session[session_name]
-            session_sequences = sum(num_seq for _, num_seq in episodes_info)
-            test_total_sequences += session_sequences
-            
-            print(f"  Session: {session_name} ({len(episodes_info)} episodes, {session_sequences} sequences)")
-            for episode_name, num_seq in sorted(episodes_info):
-                print(f"    - {episode_name}: {num_seq} sequences")
-        
-        print(f"  Test total: {test_total_sequences} sequences")
-        
-        # 显示统计摘要
-        print(f"\nSPLIT SUMMARY:")
-        print(f"  Total episodes: {len(episodes)} -> Train: {len(train_episodes)}, Test: {len(test_episodes)}")
-        print(f"  Total sequences: {len(sequences)} -> Train: {len(train_sequences)}, Test: {len(test_sequences)}")
-        print(f"  Actual split ratio: {len(train_episodes)/len(episodes):.1%} train / {len(test_episodes)/len(episodes):.1%} test")
-        print(f"  Sequence ratio: {len(train_sequences)/len(sequences):.1%} train / {len(test_sequences)/len(sequences):.1%} test")
-        
-        # 验证数据完整性
-        assert len(train_sequences) + len(test_sequences) == len(sequences), "Sequence count mismatch!"
-        assert len(train_episodes) + len(test_episodes) == len(episodes), "Episode count mismatch!"
-        print(f"  Data integrity verified")
-        
         return train_dataset, test_dataset
 
 def main():
     """Data processing main function"""
-    parser = argparse.ArgumentParser(description='CARLA vehicle data processing')
+    parser = argparse.ArgumentParser(description='CARLA vehicle data processing with relative coordinate system')
     parser.add_argument('--data_root', default='collected_data', help='CARLA data root directory')
     parser.add_argument('--output_folder', default='vehicle_datasets', help='Output folder for all pkl files')
     parser.add_argument('--max_episodes', type=int, default=None, help='Maximum episodes to process')
@@ -423,9 +449,10 @@ def main():
     
     args = parser.parse_args()
     
-    print("=== CARLA Vehicle Data Processing Tool ===")
+    print("=== CARLA Vehicle Data Processing Tool (Relative Coordinate System) ===")
     print(f"Data root directory: {args.data_root}")
     print(f"Output folder: {args.output_folder}")
+    print(f"Using relative coordinate system: current state as origin [0,0,0]")
     
     # Create data processor
     processor = VehicleDataProcessor(
@@ -455,6 +482,10 @@ def main():
     print(f"  - vehicle_lstm_dataset.pkl (complete dataset)")
     print(f"  - vehicle_train_dataset.pkl (training set)")
     print(f"  - vehicle_test_dataset.pkl (test set)")
+    print(f"\nKey changes:")
+    print(f"  - Current state normalized to [0, 0, 0, speed]")
+    print(f"  - All historical and future states in relative coordinate system") 
+    print(f"  - Preserved original position data for potential inverse transformation")
 
 if __name__ == "__main__":
     main()

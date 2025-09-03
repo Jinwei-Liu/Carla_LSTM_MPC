@@ -71,8 +71,16 @@ class VehicleLSTM(nn.Module):
         
         self.encoder_lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc_state = nn.Linear(hidden_dim, output_dim)
-        self.fc_control = nn.Linear(hidden_dim, 3)
+        self.fc_state = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, output_dim)
+        )
+        self.fc_control = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3) 
+        )
         
     def forward(self, input_features):
         encoder_out, _ = self.encoder_lstm(input_features)
@@ -91,7 +99,7 @@ class VehicleLSTM(nn.Module):
         return predicted_states, predicted_controls
 
 class TrajectoryLoss(nn.Module):
-    def __init__(self, state_weights=None, control_weight=0.1):
+    def __init__(self, state_weights=None, control_weight=0.0):
         super(TrajectoryLoss, self).__init__()
         
         if state_weights is None:
@@ -100,15 +108,26 @@ class TrajectoryLoss(nn.Module):
             self.state_weights = torch.tensor(state_weights)
             
         self.control_weight = control_weight
-        self.mse = nn.MSELoss()
+        self.mse = nn.MSELoss(reduction='none')  # Important: use 'none' for element-wise loss
     
     def forward(self, pred_states, true_states, pred_controls=None, true_controls=None):
-        state_loss = self.mse(pred_states, true_states)
+        # Calculate element-wise MSE for states
+        state_mse = self.mse(pred_states, true_states)  # (batch_size, seq_len, 4)
+        
+        # Move weights to the same device as the states
+        weights = self.state_weights.to(pred_states.device)
+        
+        # Apply weights to different state dimensions
+        # Broadcasting: (batch_size, seq_len, 4) * (4,) -> (batch_size, seq_len, 4)
+        weighted_state_loss = state_mse * weights.unsqueeze(0).unsqueeze(0)
+        
+        # Average over all dimensions
+        state_loss = weighted_state_loss.mean()
         total_loss = state_loss
         
         control_loss = torch.tensor(0.0, device=pred_states.device)
         if pred_controls is not None and true_controls is not None:
-            control_loss = self.mse(pred_controls, true_controls)
+            control_loss = self.mse(pred_controls, true_controls).mean()
             total_loss = state_loss + self.control_weight * control_loss
             return total_loss, state_loss, control_loss
         
@@ -531,9 +550,9 @@ def main():
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
-    parser.add_argument('--batch_size', type=int, default=1280, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--hidden_dim', type=int, default=32, help='LSTM hidden dimension')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='LSTM layers')
     
     # Run mode
@@ -588,7 +607,7 @@ def main():
         with open(scalers_path, 'rb') as f:
             scalers = pickle.load(f)
 
-        sample_start = 500
+        sample_start = 700
         sample_end = 1000
 
         test_dataset = VehicleDataset(test_dataset_full['training_sequences'][sample_start:sample_end],
@@ -611,7 +630,7 @@ def main():
                 seq['hist_states'], seq['hist_controls'],
                 scalers['scaler_states'], scalers['scaler_controls']
             )
-            
+            print(seq['hist_states'], pred_states, seq['future_states'])
             predictor.visualize_prediction(seq['hist_states'], pred_states, seq['future_states'])
     
     elif args.mode == 'evaluate':
