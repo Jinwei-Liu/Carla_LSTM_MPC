@@ -68,7 +68,8 @@ class VehicleLSTM(nn.Module):
         self.num_layers = num_layers
         self.predict_steps = predict_steps
         self.output_dim = output_dim
-        
+        print(f"Model initialized with input_dim={input_dim}, hidden_dim={hidden_dim}, num_layers={num_layers}, output_dim={output_dim}, predict_steps={predict_steps}")
+
         self.encoder_lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
         self.fc_state = nn.Sequential(
@@ -549,14 +550,14 @@ def main():
     parser.add_argument('--save_dir', default='models', help='Directory to save models and scalers')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='LSTM layers')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='train', 
+    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='evaluate', 
                        help='Mode: train, test, predict, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
@@ -607,7 +608,7 @@ def main():
         with open(scalers_path, 'rb') as f:
             scalers = pickle.load(f)
 
-        sample_start = 700
+        sample_start = 900
         sample_end = 1000
 
         test_dataset = VehicleDataset(test_dataset_full['training_sequences'][sample_start:sample_end],

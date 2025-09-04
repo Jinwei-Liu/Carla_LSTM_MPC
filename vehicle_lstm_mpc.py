@@ -93,27 +93,27 @@ class VehicleLSTMMPC(nn.Module):
         
         # State weight prediction head
         self.state_weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim),
+            nn.Linear(64, state_dim),
             nn.Softplus()  # Ensure positive weights
         )
         
         # Control weight prediction head
         self.control_weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, control_dim),
+            nn.Linear(64, control_dim),
             nn.Softplus()  # Ensure positive weights
         )
         
         # Target state prediction head (combined state and control targets)
         self.target_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_dim + control_dim)
+            nn.Linear(32, state_dim + control_dim)
         )
     
     def forward(self, x): 
@@ -140,7 +140,7 @@ class VehicleMPCSolver:
         
         # Create kinematic bicycle model
         self.model = Kinematic_Bicycle_MPC(dt=dt)
-        self.n_state = self.model.s_dim  # 4: [x, y, v, psi]
+        self.n_state = self.model.s_dim  # 4: [x, y, psi, v]
         self.n_ctrl = self.model.a_dim   # 2: [a, delta_f]
         
         # Control bounds
@@ -169,7 +169,7 @@ class VehicleMPCSolver:
         
         # Build quadratic cost matrices
         weights = torch.cat([state_weights, control_weights], dim=1)  # (batch, 6)
-        
+         
         # Create diagonal cost matrix C for each batch
         weight_diag = torch.diag_embed(weights)
 
@@ -250,7 +250,7 @@ class VehicleLSTMMPCTrainer:
                 current_state = batch['current_state'].to(self.device)
                 future_states = batch['future_states'].to(self.device)
                 future_actions = batch['future_actions'].to(self.device)
-                
+
                 # Forward pass
                 state_weights, control_weights, target = self.model(input_seq)
                 
@@ -334,31 +334,28 @@ class VehicleLSTMMPCTrainer:
                 target
             )
             
-            # Compare MPC trajectory with ground truth
-            mpc_steps = min(mpc_states.size(1), future_states.size(1), 20)
-            
             # State trajectory loss (position and velocity)
             position_loss = self.mse_loss(
-                mpc_states[:, :mpc_steps, :2],  # x, y
-                future_states[:, :mpc_steps, :2]
+                mpc_states[:, :, :2],  # x, y
+                future_states[:, :, :2]
             )
             
             velocity_loss = self.mse_loss(
-                mpc_states[:, :mpc_steps, 2],  # speed
-                future_states[:, :mpc_steps, 2]
+                mpc_states[:, :, 2],  # speed
+                future_states[:, :, 2]
             )
             
             heading_loss = self.mse_loss(
-                mpc_states[:, :mpc_steps, 3],  # yaw
-                future_states[:, :mpc_steps, 3]
+                mpc_states[:, :, 3],  # yaw
+                future_states[:, :, 3]
             )
             
-            trajectory_loss = position_loss + 0.5 * velocity_loss + 0.5 * heading_loss
+            trajectory_loss = position_loss + 0.01 * velocity_loss + 0.01 * heading_loss
             
             # Control loss
             control_loss = self.mse_loss(
-                mpc_controls[:, :mpc_steps],
-                future_actions[:, :mpc_steps]
+                mpc_controls[:, :],
+                future_actions[:, :]
             )
             
         except Exception as e:
@@ -376,7 +373,7 @@ class VehicleLSTMMPCTrainer:
         regularization = 0.001 * (state_weight_reg + control_weight_reg + target_reg)
         
         # Total loss
-        total_loss = trajectory_loss + 0.1 * control_loss + regularization
+        total_loss = trajectory_loss + 0.0 * control_loss + regularization
         
         return {
             'total': total_loss,
@@ -600,12 +597,12 @@ def main():
     
     # Model parameters
     parser.add_argument('--save_dir', default='models', help='Model save directory')
-    parser.add_argument('--hidden_dim', type=int, default=128, help='LSTM hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
+    parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=10, help='Training epochs')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
