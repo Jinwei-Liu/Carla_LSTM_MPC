@@ -40,7 +40,7 @@ class VehicleLSTMMPCDataset(Dataset):
         hist_controls = torch.FloatTensor(seq['hist_controls'])  # (61, 3) [throttle, brake, steer]
         
         # Convert controls to [a, delta_f] format
-        max_accel = 5.0  # m/s^2
+        max_accel = 10.0  # m/s^2
         max_steer = np.deg2rad(70)
         
         accelerations = (hist_controls[:, 0] - hist_controls[:, 1]) * max_accel
@@ -87,6 +87,10 @@ class VehicleLSTMMPC(nn.Module):
         self.state_dim = state_dim
         self.control_dim = control_dim
         
+        # Control bounds
+        self.a_bound = 10.0  # acceleration bound: [-10, 10]
+        self.delta_f_bound = np.deg2rad(70)  # steering angle bound: [-70°, 70°]
+        
         # LSTM encoder
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
                            batch_first=True)
@@ -107,16 +111,39 @@ class VehicleLSTMMPC(nn.Module):
             nn.Softplus()  # Ensure positive weights
         )
         
-        # Target state prediction head (combined state and control targets)
-        self.target_head = nn.Sequential(
+        # Target state prediction head
+        self.target_state_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, state_dim + control_dim)
+            nn.Linear(32, state_dim)
+        )
+        
+        # Target control prediction head with bounds
+        self.target_control_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, control_dim)
         )
     
-    def forward(self, x): 
+    def apply_control_bounds(self, control_raw):
+        """Apply bounds to control outputs using tanh activation"""
+        # Split the control outputs
+        a_raw = control_raw[:, 0:1]  # acceleration
+        delta_f_raw = control_raw[:, 1:2]  # steering angle
+        
+        # Apply bounds using tanh
+        a_bounded = torch.tanh(a_raw) * self.a_bound
+        delta_f_bounded = torch.tanh(delta_f_raw) * self.delta_f_bound
+        
+        # Concatenate back
+        control_bounded = torch.cat([a_bounded, delta_f_bounded], dim=1)
+        return control_bounded
+    
+    def forward(self, x):
         # LSTM encoding
         lstm_out, (hidden, cell) = self.lstm(x)
         
@@ -126,7 +153,16 @@ class VehicleLSTMMPC(nn.Module):
         # Predict MPC parameters
         state_weights = self.state_weight_head(last_hidden)  # (batch_size, 4)
         control_weights = self.control_weight_head(last_hidden)  # (batch_size, 2)
-        target = self.target_head(last_hidden)  # (batch_size, 6)
+        
+        # Predict targets separately
+        target_state = self.target_state_head(last_hidden)  # (batch_size, 4)
+        target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2)
+        
+        # Apply bounds to control targets
+        target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2)
+        
+        # Combine state and control targets
+        target = torch.cat([target_state, target_control], dim=1)  # (batch_size, 6)
         
         return state_weights, control_weights, target
 
@@ -135,7 +171,7 @@ class VehicleMPCSolver:
     
     def __init__(self, dt=0.05, horizon=100, device='cuda'):
         self.dt = dt
-        self.horizon = horizon
+        self.horizon = horizon + 1  # Include initial state in horizon
         self.device = device
         
         # Create kinematic bicycle model
@@ -144,8 +180,8 @@ class VehicleMPCSolver:
         self.n_ctrl = self.model.a_dim   # 2: [a, delta_f]
         
         # Control bounds
-        self.u_min = torch.tensor([-100.0, -np.deg2rad(70)], device=device)  # [a_min, delta_min]
-        self.u_max = torch.tensor([100.0, np.deg2rad(70)], device=device)    # [a_max, delta_max]
+        self.u_min = torch.tensor([-10.0, -np.deg2rad(70)], device=device)  # [a_min, delta_min]
+        self.u_max = torch.tensor([10.0, np.deg2rad(70)], device=device)    # [a_max, delta_max]
         
     def solve(self, initial_state, state_weights, control_weights, target):
         """
@@ -199,10 +235,10 @@ class VehicleMPCSolver:
         
         # Solve MPC problem
         x_pred, u_opt, _ = ctrl(initial_state, cost, self.model)
-        
+
         # Transpose to (batch, time, dim)
-        predicted_states = x_pred.transpose(0, 1)
-        optimal_controls = u_opt.transpose(0, 1)
+        predicted_states = x_pred.transpose(0, 1)[:,1:,:]
+        optimal_controls = u_opt.transpose(0, 1)[:,1:,:]
         
         return predicted_states, optimal_controls
         
@@ -324,7 +360,6 @@ class VehicleLSTMMPCTrainer:
     def compute_loss(self, state_weights, control_weights, target,
                      current_state, future_states, future_actions):
         """Compute MPC-based loss"""
-        
         try:
             # Use MPC solver with predicted parameters
             mpc_states, mpc_controls = self.mpc_solver.solve(
@@ -333,7 +368,6 @@ class VehicleLSTMMPCTrainer:
                 control_weights,
                 target
             )
-            
             # State trajectory loss (position and velocity)
             position_loss = self.mse_loss(
                 mpc_states[:, :, :2],  # x, y
@@ -357,7 +391,7 @@ class VehicleLSTMMPCTrainer:
                 mpc_controls[:, :],
                 future_actions[:, :]
             )
-            
+
         except Exception as e:
             # If MPC fails, use only regularization loss
             # This signals that the predicted parameters are problematic
@@ -566,6 +600,165 @@ class VehicleLSTMMPCPredictor:
         plt.tight_layout()
         plt.show()
 
+def calculate_temporal_errors(pred_states, true_states, time_step=0.05):
+    """Calculate average errors at different future time points"""
+    time_points = [1, 2, 3, 4, 5]  # seconds
+    time_indices = [int(t / time_step) - 1 for t in time_points]  # convert to indices
+    
+    error_results = {}
+    
+    for i, (t, idx) in enumerate(zip(time_points, time_indices)):
+        if idx >= pred_states.shape[1]:
+            continue
+            
+        # Position error
+        position_error = np.sqrt(
+            (pred_states[:, idx, 0] - true_states[:, idx, 0])**2 + 
+            (pred_states[:, idx, 1] - true_states[:, idx, 1])**2
+        )
+        
+        # Speed error (index 2 for LSTM-MPC states: [x, y, v, psi])
+        speed_error = np.abs(pred_states[:, idx, 2] - true_states[:, idx, 2]) * 3.6
+        
+        # Yaw error (index 3 for LSTM-MPC states: [x, y, v, psi])
+        yaw_error = np.abs(pred_states[:, idx, 3] - true_states[:, idx, 3])
+        yaw_error = np.minimum(yaw_error, 2*np.pi - yaw_error)
+        yaw_error = np.rad2deg(yaw_error)
+        
+        error_results[f'{t}s'] = {
+            'position_error_mean': np.mean(position_error),
+            'position_error_std': np.std(position_error),
+            'position_error_max': np.max(position_error),
+            'speed_error_mean': np.mean(speed_error),
+            'speed_error_std': np.std(speed_error),
+            'speed_error_max': np.max(speed_error),
+            'yaw_error_mean': np.mean(yaw_error),
+            'yaw_error_std': np.std(yaw_error),
+            'yaw_error_max': np.max(yaw_error),
+            'sample_count': len(position_error)
+        }
+    
+    return error_results
+
+def evaluate_full_dataset(predictor, test_dataset_full, device='cpu'):
+    """Evaluate entire test dataset and compute temporal error statistics"""
+    print("Starting full dataset evaluation...")
+    print(f"Total test sequences: {len(test_dataset_full['training_sequences'])}")
+    
+    all_pred_states = []
+    all_true_states = []
+    
+    for i, seq in enumerate(tqdm(test_dataset_full['training_sequences'], desc="Processing sequences")):
+        try:
+            # Convert controls to [a, delta_f] format
+            max_accel = 10.0
+            max_steer = np.deg2rad(70)
+            hist_controls = seq['hist_controls']
+            accelerations = (hist_controls[:, 0] - hist_controls[:, 1]) * max_accel
+            steer_angles = hist_controls[:, 2] * max_steer
+            hist_actions = np.column_stack([accelerations, steer_angles])
+            
+            # Predict using LSTM-MPC
+            optimal_controls, predicted_states, mpc_params = predictor.predict_control(
+                seq['hist_states'], hist_actions, seq['current_state']
+            )
+            
+            all_pred_states.append(predicted_states)
+            all_true_states.append(seq['future_states'])
+            
+        except Exception as e:
+            print(f"Error processing sequence {i}: {e}")
+            continue
+    
+    if not all_pred_states:
+        print("No valid predictions generated!")
+        return None
+    
+    # Convert to numpy arrays and ensure same shape
+    min_length = min(len(pred) for pred in all_pred_states)
+    all_pred_states = np.array([pred[:min_length] for pred in all_pred_states])
+    all_true_states = np.array([true[:min_length] for true in all_true_states])
+    
+    print(f"Successfully processed {len(all_pred_states)} sequences")
+    print(f"Prediction horizon: {min_length} steps")
+    
+    temporal_errors = calculate_temporal_errors(all_pred_states, all_true_states)
+    
+    return temporal_errors
+
+def print_error_statistics(error_results):
+    """Print error statistics results"""
+    print("\n" + "="*80)
+    print("TEMPORAL ERROR ANALYSIS RESULTS (LSTM-MPC)")
+    print("="*80)
+    
+    print(f"{'Time':<6} {'Pos.Error(m)':<15} {'Speed Error(km/h)':<18} {'Yaw Error(°)':<15} {'Samples':<8}")
+    print(f"{'Point':<6} {'Mean±Std (Max)':<15} {'Mean±Std (Max)':<18} {'Mean±Std (Max)':<15} {'Count':<8}")
+    print("-"*80)
+    
+    for time_point, errors in error_results.items():
+        pos_mean = errors['position_error_mean']
+        pos_std = errors['position_error_std']
+        pos_max = errors['position_error_max']
+        
+        speed_mean = errors['speed_error_mean']
+        speed_std = errors['speed_error_std']
+        speed_max = errors['speed_error_max']
+        
+        yaw_mean = errors['yaw_error_mean']
+        yaw_std = errors['yaw_error_std']
+        yaw_max = errors['yaw_error_max']
+        
+        sample_count = errors['sample_count']
+        
+        print(f"{time_point:<6} "
+              f"{pos_mean:.3f}±{pos_std:.3f} ({pos_max:.3f}){'':<1} "
+              f"{speed_mean:.2f}±{speed_std:.2f} ({speed_max:.2f}){'':<4} "
+              f"{yaw_mean:.2f}±{yaw_std:.2f} ({yaw_max:.2f}){'':<2} "
+              f"{sample_count:<8}")
+    
+    print("="*80)
+
+def plot_error_trends(error_results):
+    """Plot error trends over time"""
+    time_points = [1, 2, 3, 4, 5]
+    pos_means = [error_results[f'{t}s']['position_error_mean'] for t in time_points]
+    speed_means = [error_results[f'{t}s']['speed_error_mean'] for t in time_points]
+    yaw_means = [error_results[f'{t}s']['yaw_error_mean'] for t in time_points]
+    
+    pos_stds = [error_results[f'{t}s']['position_error_std'] for t in time_points]
+    speed_stds = [error_results[f'{t}s']['speed_error_std'] for t in time_points]
+    yaw_stds = [error_results[f'{t}s']['yaw_error_std'] for t in time_points]
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Position error
+    ax = axes[0]
+    ax.errorbar(time_points, pos_means, yerr=pos_stds, marker='o', capsize=5, capthick=2)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Position Error (m)')
+    ax.set_title('Position Error vs Time (LSTM-MPC)')
+    ax.grid(True, alpha=0.3)
+    
+    # Speed error
+    ax = axes[1]
+    ax.errorbar(time_points, speed_means, yerr=speed_stds, marker='s', capsize=5, capthick=2, color='orange')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Speed Error (km/h)')
+    ax.set_title('Speed Error vs Time (LSTM-MPC)')
+    ax.grid(True, alpha=0.3)
+    
+    # Yaw error
+    ax = axes[2]
+    ax.errorbar(time_points, yaw_means, yerr=yaw_stds, marker='^', capsize=5, capthick=2, color='green')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Yaw Error (degrees)')
+    ax.set_title('Yaw Error vs Time (LSTM-MPC)')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
 def load_dataset_from_folder(data_folder, dataset_name):
     """Load dataset from folder"""
     dataset_path = os.path.join(data_folder, dataset_name)
@@ -607,8 +800,9 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'predict'], default='train',
-                       help='Mode: train, test, or predict')
+    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='train',
+                       help='Mode: train, test, predict, or evaluate')
+    parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
     args = parser.parse_args()
     
@@ -669,7 +863,7 @@ def main():
             future_states = seq['future_states']
             
             # Convert controls
-            max_accel = 5.0
+            max_accel = 10.0
             max_steer = np.deg2rad(70)
             hist_controls = seq['hist_controls']
             accelerations = (hist_controls[:, 0] - hist_controls[:, 1]) * max_accel
@@ -694,6 +888,44 @@ def main():
                 future_states[:len(predicted_states)],
                 mpc_params
             )
+    
+    elif args.mode == 'evaluate':
+        print("Loading test dataset and model...")
+        
+        # Load test dataset
+        test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
+        
+        # Load model
+        model_path = os.path.join(args.save_dir, 'best_vehicle_lstm_mpc.pth')
+        if not os.path.exists(model_path):
+            print(f"Error: Model not found at {model_path}")
+            print("Please train the model first.")
+            return
+            
+        predictor = VehicleLSTMMPCPredictor(model_path)
+        
+        # Evaluate entire test dataset
+        error_results = evaluate_full_dataset(predictor, test_dataset_full)
+        
+        if error_results:
+            # Print results
+            print_error_statistics(error_results)
+            
+            # Plot trends
+            plot_error_trends(error_results)
+            
+            # Save results (optional)
+            if args.save_results:
+                results_path = os.path.join(args.save_dir, 'lstm_mpc_temporal_error_results.pkl')
+                with open(results_path, 'wb') as f:
+                    pickle.dump(error_results, f)
+                print(f"Results saved to: {results_path}")
+        else:
+            print("Evaluation failed!")
+    
+    elif args.mode == 'predict':
+        print("Interactive prediction mode")
+        print("Not implemented yet. Use 'test' mode for visualization.")
 
 if __name__ == "__main__":
     main()
