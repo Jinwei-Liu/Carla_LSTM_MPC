@@ -1,6 +1,7 @@
 """
 Vehicle LSTM-MPC Controller for CARLA
 Predicts MPC parameters using LSTM for adaptive vehicle control
+Fixed indexing: [x, y, yaw, speed] throughout
 """
 
 import torch
@@ -52,7 +53,7 @@ class VehicleLSTMMPCDataset(Dataset):
         current_state = torch.FloatTensor(seq['current_state'])  # (4,) [0, 0, 0, speed]
         
         # Future states and controls
-        future_states = torch.FloatTensor(seq['future_states'])  # (100, 4)
+        future_states = torch.FloatTensor(seq['future_states'])  # (100, 4) [x, y, yaw, speed]
         future_controls = torch.FloatTensor(seq['future_controls'])  # (100, 3)
         
         # Convert future controls
@@ -61,7 +62,8 @@ class VehicleLSTMMPCDataset(Dataset):
         future_actions = torch.stack([future_accelerations, future_steer_angles], dim=1)  # (100, 2)
         
         # Concatenate states and actions for LSTM input
-        input_seq = torch.cat([hist_states, hist_actions], dim=1)  # (61, 6)
+        # Fixed comment: [x, y, yaw, speed, a, delta_f]
+        input_seq = torch.cat([hist_states, hist_actions], dim=1)  # (61, 6) [x, y, yaw, speed, a, delta_f]
         
         return {
             'input_seq': input_seq,
@@ -143,6 +145,24 @@ class VehicleLSTMMPC(nn.Module):
         control_bounded = torch.cat([a_bounded, delta_f_bounded], dim=1)
         return control_bounded
     
+    def apply_state_bounds(self, state_raw):
+        """Apply bounds to state outputs, specifically for yaw angle"""
+        # Split the state outputs: [x, y, yaw, speed]
+        x = state_raw[:, 0:1]      # x position (no bounds)
+        y = state_raw[:, 1:2]      # y position (no bounds) 
+        yaw_raw = state_raw[:, 2:3]    # yaw angle (需要限制)
+        speed_raw = state_raw[:, 3:4]  # speed (限制为正值)
+        
+        # Apply yaw angle bounds: limit to [-π, π]
+        yaw_bounded = torch.atan2(torch.sin(yaw_raw), torch.cos(yaw_raw))
+        
+        # Apply speed bounds: ensure non-negative speed
+        speed_bounded = torch.relu(speed_raw)  # 或者使用 torch.clamp(speed_raw, min=0.0)
+        
+        # Concatenate back
+        state_bounded = torch.cat([x, y, yaw_bounded, speed_bounded], dim=1)
+        return state_bounded
+    
     def forward(self, x):
         # LSTM encoding
         lstm_out, (hidden, cell) = self.lstm(x)
@@ -155,10 +175,11 @@ class VehicleLSTMMPC(nn.Module):
         control_weights = self.control_weight_head(last_hidden)  # (batch_size, 2)
         
         # Predict targets separately
-        target_state = self.target_state_head(last_hidden)  # (batch_size, 4)
+        target_state_raw = self.target_state_head(last_hidden)  # (batch_size, 4)
         target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2)
         
-        # Apply bounds to control targets
+        # Apply bounds to targets
+        target_state = self.apply_state_bounds(target_state_raw)  # (batch_size, 4)
         target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2)
         
         # Combine state and control targets
@@ -188,7 +209,7 @@ class VehicleMPCSolver:
         Solve MPC optimization using mpc.pytorch
         
         Args:
-            initial_state: (batch_size, 4) [x, y, v, psi]
+            initial_state: (batch_size, 4) [x, y, yaw, speed]
             state_weights: (batch_size, 4) state weights
             control_weights: (batch_size, 2) control weights
             target: (batch_size, 6) target state and controls
@@ -225,7 +246,7 @@ class VehicleMPCSolver:
             T=self.horizon,
             # u_lower=u_lower,
             # u_upper=u_upper,
-            lqr_iter=3,
+            lqr_iter=30,
             grad_method=GradMethods.ANALYTIC,
             exit_unconverged=False,
             detach_unconverged=False,
@@ -369,22 +390,23 @@ class VehicleLSTMMPCTrainer:
                 target
             )
             # State trajectory loss (position and velocity)
+            # FIXED: Correct indices for [x, y, yaw, speed]
             position_loss = self.mse_loss(
                 mpc_states[:, :, :2],  # x, y
                 future_states[:, :, :2]
             )
             
-            velocity_loss = self.mse_loss(
-                mpc_states[:, :, 2],  # speed
+            heading_loss = self.mse_loss(
+                mpc_states[:, :, 2],  # yaw (index 2)
                 future_states[:, :, 2]
             )
             
-            heading_loss = self.mse_loss(
-                mpc_states[:, :, 3],  # yaw
+            velocity_loss = self.mse_loss(
+                mpc_states[:, :, 3],  # speed (index 3)
                 future_states[:, :, 3]
             )
             
-            trajectory_loss = position_loss + 0.01 * velocity_loss + 0.01 * heading_loss
+            trajectory_loss = position_loss + 0.01 * heading_loss + 0.01 * velocity_loss
             
             # Control loss
             control_loss = self.mse_loss(
@@ -486,7 +508,7 @@ class VehicleLSTMMPCPredictor:
         Predict MPC parameters and solve for optimal control
         
         Args:
-            hist_states: (seq_len, 4) historical states
+            hist_states: (seq_len, 4) historical states [x, y, yaw, speed]
             hist_actions: (seq_len, 2) historical actions
             current_state: (4,) current state
             
@@ -546,18 +568,18 @@ class VehicleLSTMMPCPredictor:
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
         
-        # Speed profile
+        # Speed profile - FIXED: speed is at index 3
         ax = axes[0, 1]
         time_hist = np.arange(len(hist_states)) * 0.05
         time_pred = np.arange(len(predicted_states)) * 0.05
         
-        ax.plot(time_hist, hist_states[:, 2] * 3.6, 'b-', label='History', linewidth=2)
-        ax.plot(time_pred, predicted_states[:, 2] * 3.6, 'r--', label='MPC Predicted', linewidth=2)
+        ax.plot(time_hist, hist_states[:, 3] * 3.6, 'b-', label='History', linewidth=2)  # Fixed: index 3 for speed
+        ax.plot(time_pred, predicted_states[:, 3] * 3.6, 'r--', label='MPC Predicted', linewidth=2)  # Fixed: index 3
         if true_states is not None:
-            ax.plot(time_pred, true_states[:, 2] * 3.6, 'g-', label='Ground Truth', linewidth=2)
+            ax.plot(time_pred, true_states[:, 3] * 3.6, 'g-', label='Ground Truth', linewidth=2)  # Fixed: index 3
         
         if mpc_params is not None:
-            ax.axhline(y=mpc_params['target_state'][2] * 3.6, color='r', linestyle=':', label='Target Speed')
+            ax.axhline(y=mpc_params['target_state'][3] * 3.6, color='r', linestyle=':', label='Target Speed')  # Fixed: index 3
         
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Speed (km/h)')
@@ -565,12 +587,12 @@ class VehicleLSTMMPCPredictor:
         ax.legend()
         ax.grid(True, alpha=0.3)
         
-        # Yaw angle
+        # Yaw angle - FIXED: yaw is at index 2
         ax = axes[1, 0]
-        ax.plot(time_hist, np.rad2deg(hist_states[:, 3]), 'b-', label='History', linewidth=2)
-        ax.plot(time_pred, np.rad2deg(predicted_states[:, 3]), 'r--', label='MPC Predicted', linewidth=2)
+        ax.plot(time_hist, np.rad2deg(hist_states[:, 2]), 'b-', label='History', linewidth=2)  # Fixed: index 2 for yaw
+        ax.plot(time_pred, np.rad2deg(predicted_states[:, 2]), 'r--', label='MPC Predicted', linewidth=2)  # Fixed: index 2
         if true_states is not None:
-            ax.plot(time_pred, np.rad2deg(true_states[:, 3]), 'g-', label='Ground Truth', linewidth=2)
+            ax.plot(time_pred, np.rad2deg(true_states[:, 2]), 'g-', label='Ground Truth', linewidth=2)  # Fixed: index 2
         
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Yaw Angle (degrees)')
@@ -617,13 +639,13 @@ def calculate_temporal_errors(pred_states, true_states, time_step=0.05):
             (pred_states[:, idx, 1] - true_states[:, idx, 1])**2
         )
         
-        # Speed error (index 2 for LSTM-MPC states: [x, y, v, psi])
-        speed_error = np.abs(pred_states[:, idx, 2] - true_states[:, idx, 2]) * 3.6
-        
-        # Yaw error (index 3 for LSTM-MPC states: [x, y, v, psi])
-        yaw_error = np.abs(pred_states[:, idx, 3] - true_states[:, idx, 3])
+        # Yaw error (index 2 for states: [x, y, yaw, speed])
+        yaw_error = np.abs(pred_states[:, idx, 2] - true_states[:, idx, 2])
         yaw_error = np.minimum(yaw_error, 2*np.pi - yaw_error)
         yaw_error = np.rad2deg(yaw_error)
+        
+        # Speed error (index 3 for states: [x, y, yaw, speed])
+        speed_error = np.abs(pred_states[:, idx, 3] - true_states[:, idx, 3]) * 3.6
         
         error_results[f'{t}s'] = {
             'position_error_mean': np.mean(position_error),
@@ -854,7 +876,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(min(5, len(test_dataset_full['training_sequences']))):
+        for i in range(2000, min(5000, len(test_dataset_full['training_sequences']))):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
