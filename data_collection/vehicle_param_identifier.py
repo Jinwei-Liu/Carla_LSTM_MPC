@@ -69,8 +69,8 @@ class BicycleModelFitter:
             return psi_dot_pred - valid_data['psi_dot'].values
             
         initial_guess = [1.4, 1.4]
-        lower_bounds = [0.8, 0.8]
-        upper_bounds = [2.0, 2.0]
+        lower_bounds = [0.0, 0.0]
+        upper_bounds = [20.0, 20.0]
         
         print("\nFitting parameters...")
         result = least_squares(

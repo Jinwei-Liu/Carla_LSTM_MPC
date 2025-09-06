@@ -3,7 +3,7 @@ import torch.nn as nn
 
 class Kinematic_Bicycle_MPC(nn.Module):
     """Kinematic bicycle model with side slip angle"""
-    def __init__(self, dt=0.05, wheelbase=3.76, lr=2.00, lf=1.76):
+    def __init__(self, dt=0.05, wheelbase=3.45, lr=3.45, lf=0.00):
         super().__init__()
         self.s_dim = 4  # [x, y, psi, v]
         self.a_dim = 2  # [a, delta_f]

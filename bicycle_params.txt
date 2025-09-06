@@ -1,0 +1,10 @@
+==================================================
+KINEMATIC BICYCLE MODEL PARAMETERS
+==================================================
+
+l_f (front axle to CoM): 0.0000 m
+l_r (rear axle to CoM):  3.4523 m
+L (wheelbase):           3.4523 m
+
+Max steering angle:      70бу
+Data points used:        414
