@@ -882,13 +882,13 @@ def main():
     parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
     
     # MPC downsampling parameter
-    parser.add_argument('--downsample_factor', type=int, default=5, 
+    parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=10, help='Training epochs')
+    parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
@@ -948,7 +948,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(min(3, len(test_dataset_full['training_sequences']))):
+        for i in range(9500, 10000):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
