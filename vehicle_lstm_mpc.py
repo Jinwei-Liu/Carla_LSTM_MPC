@@ -1,8 +1,6 @@
 """
-Vehicle LSTM-MPC Controller for CARLA with Downsampling Factor
-Predicts MPC parameters using LSTM for adaptive vehicle control
-Fixed indexing: [x, y, yaw, speed] throughout
-Added downsampling factor for MPC computation efficiency
+Vehicle LSTM-MPC Controller for CARLA with Multiple Target Points
+Modified to support multiple target points across the MPC horizon
 """
 
 import torch
@@ -63,7 +61,6 @@ class VehicleLSTMMPCDataset(Dataset):
         future_actions = torch.stack([future_accelerations, future_steer_angles], dim=1)  # (100, 2)
         
         # Concatenate states and actions for LSTM input
-        # Fixed comment: [x, y, yaw, speed, a, delta_f]
         input_seq = torch.cat([hist_states, hist_actions], dim=1)  # (61, 6) [x, y, yaw, speed, a, delta_f]
         
         return {
@@ -74,14 +71,15 @@ class VehicleLSTMMPCDataset(Dataset):
         }
 
 class VehicleLSTMMPC(nn.Module):
-    """LSTM network for predicting MPC parameters"""
+    """LSTM network for predicting MPC parameters with multiple targets"""
     
     def __init__(self, 
                  input_dim=6,      # [x, y, yaw, speed, a, delta_f]
                  hidden_dim=128,
                  num_layers=1,
                  state_dim=4,      # [x, y, yaw, speed]
-                 control_dim=2):   # [a, delta_f]
+                 control_dim=2,    # [a, delta_f]
+                 num_targets=1):   # Number of target points
         super(VehicleLSTMMPC, self).__init__()
         
         self.input_dim = input_dim
@@ -89,6 +87,7 @@ class VehicleLSTMMPC(nn.Module):
         self.num_layers = num_layers
         self.state_dim = state_dim
         self.control_dim = control_dim
+        self.num_targets = num_targets
         
         # Control bounds
         self.a_bound = 10.0  # acceleration bound: [-10, 10]
@@ -114,55 +113,67 @@ class VehicleLSTMMPC(nn.Module):
             nn.Softplus()  # Ensure positive weights
         )
         
-        # Target state prediction head
+        # Target state prediction head - now outputs multiple targets
         self.target_state_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, state_dim)
+            nn.Linear(32, state_dim * num_targets)  # Output multiple targets
         )
         
-        # Target control prediction head with bounds
+        # Target control prediction head - now outputs multiple targets
         self.target_control_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, control_dim)
+            nn.Linear(32, control_dim * num_targets)  # Output multiple targets
         )
     
     def apply_control_bounds(self, control_raw):
         """Apply bounds to control outputs using tanh activation"""
+        # Reshape to handle multiple targets: (batch_size, num_targets, control_dim)
+        batch_size = control_raw.size(0)
+        control_reshaped = control_raw.view(batch_size, self.num_targets, self.control_dim)
+        
         # Split the control outputs
-        a_raw = control_raw[:, 0:1]  # acceleration
-        delta_f_raw = control_raw[:, 1:2]  # steering angle
+        a_raw = control_reshaped[:, :, 0:1]  # acceleration
+        delta_f_raw = control_reshaped[:, :, 1:2]  # steering angle
         
         # Apply bounds using tanh
         a_bounded = torch.tanh(a_raw) * self.a_bound
         delta_f_bounded = torch.tanh(delta_f_raw) * self.delta_f_bound
         
         # Concatenate back
-        control_bounded = torch.cat([a_bounded, delta_f_bounded], dim=1)
-        return control_bounded
+        control_bounded = torch.cat([a_bounded, delta_f_bounded], dim=2)
+        
+        # Reshape back to (batch_size, num_targets * control_dim)
+        return control_bounded.view(batch_size, -1)
     
     def apply_state_bounds(self, state_raw):
         """Apply bounds to state outputs, specifically for yaw angle"""
+        # Reshape to handle multiple targets: (batch_size, num_targets, state_dim)
+        batch_size = state_raw.size(0)
+        state_reshaped = state_raw.view(batch_size, self.num_targets, self.state_dim)
+        
         # Split the state outputs: [x, y, yaw, speed]
-        x = state_raw[:, 0:1]      # x position (no bounds)
-        y = state_raw[:, 1:2]      # y position (no bounds) 
-        yaw_raw = state_raw[:, 2:3]    # yaw angle (需要限制)
-        speed_raw = state_raw[:, 3:4]  # speed (限制为正值)
+        x = state_reshaped[:, :, 0:1]      # x position (no bounds)
+        y = state_reshaped[:, :, 1:2]      # y position (no bounds) 
+        yaw_raw = state_reshaped[:, :, 2:3]    # yaw angle (需要限制)
+        speed_raw = state_reshaped[:, :, 3:4]  # speed (限制为正值)
         
         # Apply yaw angle bounds: limit to [-π, π]
         yaw_bounded = torch.atan2(torch.sin(yaw_raw), torch.cos(yaw_raw))
         
         # Apply speed bounds: ensure non-negative speed
-        speed_bounded = torch.relu(speed_raw)  # 或者使用 torch.clamp(speed_raw, min=0.0)
+        speed_bounded = torch.relu(speed_raw)
         
         # Concatenate back
-        state_bounded = torch.cat([x, y, yaw_bounded, speed_bounded], dim=1)
-        return state_bounded
+        state_bounded = torch.cat([x, y, yaw_bounded, speed_bounded], dim=2)
+        
+        # Reshape back to (batch_size, num_targets * state_dim)
+        return state_bounded.view(batch_size, -1)
     
     def forward(self, x):
         # LSTM encoding
@@ -175,35 +186,37 @@ class VehicleLSTMMPC(nn.Module):
         state_weights = self.state_weight_head(last_hidden)  # (batch_size, 4)
         control_weights = self.control_weight_head(last_hidden)  # (batch_size, 2)
         
-        # Predict targets separately
-        target_state_raw = self.target_state_head(last_hidden)  # (batch_size, 4)
-        target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2)
+        # Predict targets separately - now multiple targets
+        target_state_raw = self.target_state_head(last_hidden)  # (batch_size, 4 * num_targets)
+        target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2 * num_targets)
         
         # Apply bounds to targets
-        target_state = self.apply_state_bounds(target_state_raw)  # (batch_size, 4)
-        target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2)
+        target_state = self.apply_state_bounds(target_state_raw)  # (batch_size, 4 * num_targets)
+        target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2 * num_targets)
         
         # Combine state and control targets
-        target = torch.cat([target_state, target_control], dim=1)  # (batch_size, 6)
+        target = torch.cat([target_state, target_control], dim=1)  # (batch_size, 6 * num_targets)
         
         return state_weights, control_weights, target
 
 class VehicleMPCSolver:
-    """MPC solver using mpc.pytorch library with kinematic bicycle model and downsampling"""
+    """MPC solver using mpc.pytorch library with kinematic bicycle model and multiple targets"""
     
-    def __init__(self, dt=0.05, horizon=100, device='cuda', downsample_factor=1):
+    def __init__(self, dt=0.05, horizon=100, device='cuda', downsample_factor=1, num_targets=1):
         """
         Args:
             dt: Original sampling time (0.05s)
             horizon: Original horizon steps (100)
             device: Computing device
-            downsample_factor: Factor to downsample MPC computation (e.g., 2 means MPC dt = 0.1s)
+            downsample_factor: Factor to downsample MPC computation
+            num_targets: Number of target points to use
         """
         self.original_dt = dt
         self.downsample_factor = downsample_factor
         self.mpc_dt = dt * downsample_factor  # MPC sampling time
         self.mpc_horizon = horizon // downsample_factor + 1  # Downsampled horizon
         self.device = device
+        self.num_targets = num_targets
         
         # Create kinematic bicycle model with MPC sampling time
         self.model = Kinematic_Bicycle_MPC(dt=self.mpc_dt)
@@ -218,16 +231,55 @@ class VehicleMPCSolver:
         print(f"  Original dt: {self.original_dt}s, MPC dt: {self.mpc_dt}s")
         print(f"  Downsample factor: {self.downsample_factor}")
         print(f"  MPC horizon: {self.mpc_horizon} steps")
+        print(f"  Number of targets: {self.num_targets}")
+        
+    def distribute_targets_across_horizon(self, targets):
+        """
+        Distribute multiple targets across the MPC horizon
+        
+        Args:
+            targets: (batch_size, 6 * num_targets) - concatenated state and control targets
+            
+        Returns:
+            distributed_targets: (mpc_horizon, batch_size, 6) - targets for each time step
+        """
+        batch_size = targets.size(0)
+        
+        # Reshape targets to (batch_size, num_targets, 6)
+        targets_reshaped = targets.view(batch_size, self.num_targets, 6)
+        
+        # Calculate how many time steps each target should cover
+        steps_per_target = self.mpc_horizon // self.num_targets
+        remaining_steps = self.mpc_horizon % self.num_targets
+        
+        # Create the distributed targets tensor
+        distributed_targets = torch.zeros(self.mpc_horizon, batch_size, 6, 
+                                        device=targets.device, dtype=targets.dtype)
+        
+        current_step = 0
+        for target_idx in range(self.num_targets):
+            # Calculate how many steps this target covers
+            steps_for_this_target = steps_per_target
+            if target_idx < remaining_steps:  # Distribute remaining steps to first targets
+                steps_for_this_target += 1
+            
+            # Assign this target to the corresponding time steps
+            end_step = current_step + steps_for_this_target
+            distributed_targets[current_step:end_step] = targets_reshaped[:, target_idx, :].unsqueeze(0)
+            
+            current_step = end_step
+        
+        return distributed_targets
         
     def solve(self, initial_state, state_weights, control_weights, target):
         """
-        Solve MPC optimization using mpc.pytorch
+        Solve MPC optimization using mpc.pytorch with multiple targets
         
         Args:
             initial_state: (batch_size, 4) [x, y, yaw, speed]
             state_weights: (batch_size, 4) state weights
             control_weights: (batch_size, 2) control weights
-            target: (batch_size, 6) target state and controls
+            target: (batch_size, 6 * num_targets) multiple target states and controls
             
         Returns:
             predicted_states: (batch_size, mpc_horizon-1, 4)
@@ -244,12 +296,13 @@ class VehicleMPCSolver:
          
         # Create diagonal cost matrix C for each batch
         weight_diag = torch.diag_embed(weights)
+        C = weight_diag.unsqueeze(0).repeat(self.mpc_horizon, 1, 1, 1)  # [T, batch_size, 6, 6]
 
-        C = weight_diag.unsqueeze(0).repeat(self.mpc_horizon, 1, 1, 1)  # [T, batch_size, n_state+n_ctrl, n_state+n_ctrl]
-
-        target = target.unsqueeze(0).repeat(self.mpc_horizon, 1, 1)  # [T, batch_size, n_state+n_ctrl]
-        # Build cost vectors
-        c = -torch.sqrt(weights).unsqueeze(0) * target  # [T, batch_size, n_state+n_ctrl]
+        # Distribute targets across horizon
+        distributed_targets = self.distribute_targets_across_horizon(target)  # [T, batch_size, 6]
+        
+        # Build cost vectors with distributed targets
+        c = -torch.sqrt(weights).unsqueeze(0) * distributed_targets  # [T, batch_size, 6]
 
         # Create QuadCost object
         cost = QuadCost(C, c)
@@ -259,8 +312,6 @@ class VehicleMPCSolver:
             n_state=self.n_state,
             n_ctrl=self.n_ctrl,
             T=self.mpc_horizon,
-            # u_lower=u_lower,
-            # u_upper=u_upper,
             lqr_iter=10,
             grad_method=GradMethods.ANALYTIC,
             exit_unconverged=False,
@@ -279,28 +330,31 @@ class VehicleMPCSolver:
         return predicted_states, optimal_controls
         
 class VehicleLSTMMPCTrainer:
-    """Trainer for Vehicle LSTM-MPC model with downsampling support"""
+    """Trainer for Vehicle LSTM-MPC model with multiple targets support"""
     
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', downsample_factor=1):
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', 
+                 downsample_factor=1, num_targets=1):
         self.model = model.to(device)
         self.device = device
         self.downsample_factor = downsample_factor
+        self.num_targets = num_targets
         self.train_losses = []
         self.val_losses = []
         
-        # MPC solver with downsampling
+        # MPC solver with downsampling and multiple targets
         self.mpc_solver = VehicleMPCSolver(
             dt=0.05, 
             horizon=100, 
             device=device,
-            downsample_factor=downsample_factor
+            downsample_factor=downsample_factor,
+            num_targets=num_targets
         )
         
         # Loss functions
         self.mse_loss = nn.MSELoss()
         self.l1_loss = nn.L1Loss()
         
-        print(f"Trainer initialized with downsample_factor={downsample_factor}")
+        print(f"Trainer initialized with downsample_factor={downsample_factor}, num_targets={num_targets}")
         
     def train_model(self, train_loader, val_loader, epochs=100, lr=1e-3, patience=15, save_dir='models'):
         
@@ -315,6 +369,7 @@ class VehicleLSTMMPCTrainer:
         print(f"Training on {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"Downsample factor: {self.downsample_factor}")
+        print(f"Number of targets: {self.num_targets}")
         
         for epoch in range(epochs):
             # Training phase
@@ -376,7 +431,7 @@ class VehicleLSTMMPCTrainer:
                 best_val_loss = val_loss
                 patience_counter = 0
                 
-                model_path = os.path.join(save_dir, f'best_vehicle_lstm_mpc_ds{self.downsample_factor}.pth')
+                model_path = os.path.join(save_dir, f'best_vehicle_lstm_mpc_ds{self.downsample_factor}_targets{self.num_targets}.pth')
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -385,9 +440,11 @@ class VehicleLSTMMPCTrainer:
                         'hidden_dim': self.model.hidden_dim,
                         'num_layers': self.model.num_layers,
                         'state_dim': self.model.state_dim,
-                        'control_dim': self.model.control_dim
+                        'control_dim': self.model.control_dim,
+                        'num_targets': self.model.num_targets
                     },
                     'downsample_factor': self.downsample_factor,
+                    'num_targets': self.num_targets,
                     'epoch': epoch,
                     'val_loss': val_loss,
                     'train_losses': self.train_losses,
@@ -405,7 +462,7 @@ class VehicleLSTMMPCTrainer:
         
     def compute_loss(self, state_weights, control_weights, target,
                      current_state, future_states, future_actions):
-        """Compute MPC-based loss with downsampling"""
+        """Compute MPC-based loss with multiple targets"""
         try:
             # Use MPC solver with predicted parameters
             mpc_states, mpc_controls = self.mpc_solver.solve(
@@ -416,7 +473,6 @@ class VehicleLSTMMPCTrainer:
             )
             
             # Downsample ground truth for comparison
-            # Select every downsample_factor-th sample from future states/actions
             downsampled_indices = torch.arange(
                 0, 
                 min(future_states.size(1), mpc_states.size(1) * self.downsample_factor), 
@@ -514,7 +570,7 @@ class VehicleLSTMMPCTrainer:
                 val_reg_loss / len(val_loader))
 
 class VehicleLSTMMPCPredictor:
-    """Online predictor for vehicle control with downsampling support"""
+    """Online predictor for vehicle control with multiple targets support"""
     
     def __init__(self, model_path, device='cpu', horizon=100):
         self.device = device
@@ -526,8 +582,9 @@ class VehicleLSTMMPCPredictor:
         
         checkpoint = torch.load(model_path, map_location=device)
         
-        # Get downsample factor
+        # Get parameters
         self.downsample_factor = checkpoint.get('downsample_factor', 1)
+        self.num_targets = checkpoint.get('num_targets', 1)
         
         # Rebuild model
         config = checkpoint['model_config']
@@ -536,38 +593,31 @@ class VehicleLSTMMPCPredictor:
             hidden_dim=config['hidden_dim'],
             num_layers=config['num_layers'],
             state_dim=config['state_dim'],
-            control_dim=config['control_dim']
+            control_dim=config['control_dim'],
+            num_targets=config.get('num_targets', 1)
         )
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(device)
         self.model.eval()
         
-        # MPC solver with downsampling
+        # MPC solver with multiple targets
         self.mpc_solver = VehicleMPCSolver(
             dt=0.05, 
             horizon=horizon, 
             device=device,
-            downsample_factor=self.downsample_factor
+            downsample_factor=self.downsample_factor,
+            num_targets=self.num_targets
         )
         
         print(f"Model loaded from {model_path}")
         print(f"Validation loss: {checkpoint['val_loss']:.6f}")
         print(f"Downsample factor: {self.downsample_factor}")
+        print(f"Number of targets: {self.num_targets}")
     
     def predict_control(self, hist_states, hist_actions, current_state):
         """
-        Predict MPC parameters and solve for optimal control
-        
-        Args:
-            hist_states: (seq_len, 4) historical states [x, y, yaw, speed]
-            hist_actions: (seq_len, 2) historical actions
-            current_state: (4,) current state
-            
-        Returns:
-            optimal_controls: (mpc_horizon-1, 2) optimal control sequence
-            predicted_states: (mpc_horizon-1, 4) predicted state trajectory
-            mpc_params: dict of MPC parameters
+        Predict MPC parameters and solve for optimal control with multiple targets
         """
         
         # Prepare input
@@ -588,12 +638,24 @@ class VehicleLSTMMPCPredictor:
         optimal_controls = optimal_controls.cpu().numpy().squeeze()
         predicted_states = predicted_states.cpu().numpy().squeeze()
         
+        # Parse multiple targets for visualization
+        target_np = target.cpu().numpy().squeeze()
+        targets_parsed = []
+        
+        for i in range(self.num_targets):
+            start_idx = i * 6
+            target_state = target_np[start_idx:start_idx+4]
+            target_control = target_np[start_idx+4:start_idx+6]
+            targets_parsed.append({
+                'state': target_state,
+                'control': target_control
+            })
+        
         mpc_params = {
             'state_weights': state_weights.cpu().numpy().squeeze(),
             'control_weights': control_weights.cpu().numpy().squeeze(),
-            'target': target.cpu().numpy().squeeze(),
-            'target_state': target[:, :4].cpu().numpy().squeeze(),
-            'target_control': target[:, 4:].cpu().numpy().squeeze(),
+            'targets': targets_parsed,
+            'num_targets': self.num_targets,
             'downsample_factor': self.downsample_factor,
             'mpc_dt': self.mpc_solver.mpc_dt,
             'mpc_horizon': self.mpc_solver.mpc_horizon
@@ -602,7 +664,7 @@ class VehicleLSTMMPCPredictor:
         return optimal_controls, predicted_states, mpc_params
     
     def visualize_prediction(self, hist_states, predicted_states, true_states=None, mpc_params=None):
-        """Visualize prediction results with downsampling consideration"""
+        """Visualize prediction results with multiple targets"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         
         # Trajectory plot
@@ -613,13 +675,18 @@ class VehicleLSTMMPCPredictor:
         if true_states is not None:
             ax.plot(true_states[:, 0], true_states[:, 1], 'g-', label='Ground Truth', linewidth=2)
         
-        if mpc_params is not None:
-            target_state = mpc_params['target_state']
-            ax.plot(target_state[0], target_state[1], 'r*', markersize=15, label='Target')
+        # Plot multiple targets
+        if mpc_params is not None and 'targets' in mpc_params:
+            colors = ['red', 'orange', 'purple', 'brown', 'pink']
+            for i, target_info in enumerate(mpc_params['targets']):
+                target_state = target_info['state']
+                color = colors[i % len(colors)]
+                ax.plot(target_state[0], target_state[1], '*', markersize=15, 
+                       color=color, label=f'Target {i+1}')
         
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
-        ax.set_title(f'Vehicle Trajectory (LSTM-MPC, DS Factor={mpc_params.get("downsample_factor", 1)})')
+        ax.set_title(f'Vehicle Trajectory (LSTM-MPC, DS={mpc_params.get("downsample_factor", 1)}, Targets={mpc_params.get("num_targets", 1)})')
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
@@ -635,8 +702,14 @@ class VehicleLSTMMPCPredictor:
         if true_states is not None:
             ax.plot(time_true, true_states[:, 3] * 3.6, 'g-', label='Ground Truth', linewidth=2)
         
-        if mpc_params is not None:
-            ax.axhline(y=mpc_params['target_state'][3] * 3.6, color='r', linestyle=':', label='Target Speed')
+        # Plot target speeds
+        if mpc_params is not None and 'targets' in mpc_params:
+            colors = ['red', 'orange', 'purple', 'brown', 'pink']
+            for i, target_info in enumerate(mpc_params['targets']):
+                target_speed = target_info['state'][3] * 3.6
+                color = colors[i % len(colors)]
+                ax.axhline(y=target_speed, color=color, linestyle=':', 
+                          alpha=0.7, label=f'Target Speed {i+1}')
         
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Speed (km/h)')
@@ -668,7 +741,7 @@ class VehicleLSTMMPCPredictor:
             bars = ax.bar(weights_labels, weights_values, color=colors, alpha=0.7)
             
             ax.set_ylabel('Weight Value')
-            ax.set_title(f'MPC Weights (DS={mpc_params["downsample_factor"]}, dt={mpc_params["mpc_dt"]:.2f}s)')
+            ax.set_title(f'MPC Weights (DS={mpc_params["downsample_factor"]}, Targets={mpc_params["num_targets"]})')
             ax.grid(True, alpha=0.3, axis='y')
             
             for bar in bars:
@@ -679,6 +752,7 @@ class VehicleLSTMMPCPredictor:
         plt.tight_layout()
         plt.show()
 
+# Keep all other functions unchanged (calculate_temporal_errors, evaluate_full_dataset, etc.)
 def calculate_temporal_errors(pred_states, true_states, time_step=0.05, downsample_factor=1):
     """Calculate average errors at different future time points"""
     time_points = [1, 2, 3, 4, 5]  # seconds
@@ -724,6 +798,7 @@ def evaluate_full_dataset(predictor, test_dataset_full, device='cpu'):
     print("Starting full dataset evaluation...")
     print(f"Total test sequences: {len(test_dataset_full['training_sequences'])}")
     print(f"Using downsample factor: {predictor.downsample_factor}")
+    print(f"Using number of targets: {predictor.num_targets}")
     
     all_pred_states = []
     all_true_states = []
@@ -774,10 +849,10 @@ def evaluate_full_dataset(predictor, test_dataset_full, device='cpu'):
     
     return temporal_errors
 
-def print_error_statistics(error_results, downsample_factor=1):
+def print_error_statistics(error_results, downsample_factor=1, num_targets=1):
     """Print error statistics results"""
     print("\n" + "="*80)
-    print(f"TEMPORAL ERROR ANALYSIS RESULTS (LSTM-MPC, Downsample Factor={downsample_factor})")
+    print(f"TEMPORAL ERROR ANALYSIS RESULTS (LSTM-MPC, DS={downsample_factor}, Targets={num_targets})")
     print("="*80)
     
     print(f"{'Time':<6} {'Pos.Error(m)':<15} {'Speed Error(km/h)':<18} {'Yaw Error(°)':<15} {'Samples':<8}")
@@ -807,7 +882,7 @@ def print_error_statistics(error_results, downsample_factor=1):
     
     print("="*80)
 
-def plot_error_trends(error_results, downsample_factor=1):
+def plot_error_trends(error_results, downsample_factor=1, num_targets=1):
     """Plot error trends over time"""
     time_points = [1, 2, 3, 4, 5]
     pos_means = [error_results[f'{t}s']['position_error_mean'] for t in time_points]
@@ -825,7 +900,7 @@ def plot_error_trends(error_results, downsample_factor=1):
     ax.errorbar(time_points, pos_means, yerr=pos_stds, marker='o', capsize=5, capthick=2)
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Position Error (m)')
-    ax.set_title(f'Position Error vs Time (LSTM-MPC, DS={downsample_factor})')
+    ax.set_title(f'Position Error vs Time (LSTM-MPC, DS={downsample_factor}, Targets={num_targets})')
     ax.grid(True, alpha=0.3)
     
     # Speed error
@@ -833,7 +908,7 @@ def plot_error_trends(error_results, downsample_factor=1):
     ax.errorbar(time_points, speed_means, yerr=speed_stds, marker='s', capsize=5, capthick=2, color='orange')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Speed Error (km/h)')
-    ax.set_title(f'Speed Error vs Time (LSTM-MPC, DS={downsample_factor})')
+    ax.set_title(f'Speed Error vs Time (LSTM-MPC, DS={downsample_factor}, Targets={num_targets})')
     ax.grid(True, alpha=0.3)
     
     # Yaw error
@@ -841,7 +916,7 @@ def plot_error_trends(error_results, downsample_factor=1):
     ax.errorbar(time_points, yaw_means, yerr=yaw_stds, marker='^', capsize=5, capthick=2, color='green')
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Yaw Error (degrees)')
-    ax.set_title(f'Yaw Error vs Time (LSTM-MPC, DS={downsample_factor})')
+    ax.set_title(f'Yaw Error vs Time (LSTM-MPC, DS={downsample_factor}, Targets={num_targets})')
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -869,7 +944,7 @@ def load_dataset_from_folder(data_folder, dataset_name):
     return dataset
 
 def main():
-    parser = argparse.ArgumentParser(description='Vehicle LSTM-MPC Training and Prediction with Downsampling')
+    parser = argparse.ArgumentParser(description='Vehicle LSTM-MPC Training and Prediction with Multiple Targets')
     
     # Data parameters
     parser.add_argument('--data_folder', default='vehicle_datasets', help='Folder containing datasets')
@@ -881,9 +956,11 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
     
-    # MPC downsampling parameter
+    # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
+    parser.add_argument('--num_targets', type=int, default=2, 
+                       help='Number of target points to use across MPC horizon')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
@@ -892,16 +969,18 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='train',
+    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='test',
                        help='Mode: train, test, or evaluate')
+    parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
     
-    print(f"=== Vehicle LSTM-MPC Controller with Downsampling ===")
+    print(f"=== Vehicle LSTM-MPC Controller with Multiple Targets ===")
     print(f"Mode: {args.mode}")
     print(f"Downsample Factor: {args.downsample_factor}")
+    print(f"Number of Targets: {args.num_targets}")
     print(f"MPC dt: {0.05 * args.downsample_factor:.2f}s")
     print(f"MPC horizon: {100 // args.downsample_factor} steps")
     
@@ -918,17 +997,20 @@ def main():
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
         
-        # Create model
+        # Create model with multiple targets
         model = VehicleLSTMMPC(
             input_dim=6,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             state_dim=4,
-            control_dim=2
+            control_dim=2,
+            num_targets=args.num_targets
         )
         
-        # Create trainer with downsampling
-        trainer = VehicleLSTMMPCTrainer(model, downsample_factor=args.downsample_factor)
+        # Create trainer with multiple targets
+        trainer = VehicleLSTMMPCTrainer(model, 
+                                      downsample_factor=args.downsample_factor,
+                                      num_targets=args.num_targets)
         
         # Train model
         trainer.train_model(
@@ -944,11 +1026,11 @@ def main():
         test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
         # Load model
-        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}.pth')
+        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}.pth')
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(3000, 10000):
+        for i in range(5000, 10000):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
@@ -971,7 +1053,10 @@ def main():
             
             print(f"\nTest Sample {i+1}:")
             print(f"  Current state: {current_state}")
-            print(f"  Target: {mpc_params['target']}")
+            print(f"  Number of targets: {mpc_params['num_targets']}")
+            for j, target_info in enumerate(mpc_params['targets']):
+                print(f"  Target {j+1} state: {target_info['state']}")
+                print(f"  Target {j+1} control: {target_info['control']}")
             print(f"  State weights: {mpc_params['state_weights']}")
             print(f"  Control weights: {mpc_params['control_weights']}")
             print(f"  MPC dt: {mpc_params['mpc_dt']:.2f}s")
@@ -996,7 +1081,7 @@ def main():
         test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
         # Load model
-        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}.pth')
+        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}.pth')
         if not os.path.exists(model_path):
             print(f"Error: Model not found at {model_path}")
             print("Please train the model first.")
@@ -1009,18 +1094,23 @@ def main():
         
         if error_results:
             # Print results
-            print_error_statistics(error_results, downsample_factor=predictor.downsample_factor)
+            print_error_statistics(error_results, 
+                                 downsample_factor=predictor.downsample_factor,
+                                 num_targets=predictor.num_targets)
             
             # Plot trends
-            plot_error_trends(error_results, downsample_factor=predictor.downsample_factor)
+            plot_error_trends(error_results, 
+                            downsample_factor=predictor.downsample_factor,
+                            num_targets=predictor.num_targets)
             
             # Save results (optional)
             if args.save_results:
-                results_path = os.path.join(args.save_dir, f'lstm_mpc_temporal_error_results_ds{predictor.downsample_factor}.pkl')
+                results_path = os.path.join(args.save_dir, f'lstm_mpc_temporal_error_results_ds{predictor.downsample_factor}_targets{predictor.num_targets}.pkl')
                 with open(results_path, 'wb') as f:
                     pickle.dump({
                         'error_results': error_results,
                         'downsample_factor': predictor.downsample_factor,
+                        'num_targets': predictor.num_targets,
                         'mpc_dt': predictor.mpc_solver.mpc_dt,
                         'mpc_horizon': predictor.mpc_solver.mpc_horizon
                     }, f)
