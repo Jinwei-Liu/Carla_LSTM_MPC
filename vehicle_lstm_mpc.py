@@ -148,8 +148,7 @@ class VehicleLSTMMPC(nn.Module):
         # Concatenate back
         control_bounded = torch.cat([a_bounded, delta_f_bounded], dim=2)
         
-        # Reshape back to (batch_size, num_targets * control_dim)
-        return control_bounded.view(batch_size, -1)
+        return control_bounded
     
     def apply_state_bounds(self, state_raw):
         """Apply bounds to state outputs, specifically for yaw angle"""
@@ -172,8 +171,7 @@ class VehicleLSTMMPC(nn.Module):
         # Concatenate back
         state_bounded = torch.cat([x, y, yaw_bounded, speed_bounded], dim=2)
         
-        # Reshape back to (batch_size, num_targets * state_dim)
-        return state_bounded.view(batch_size, -1)
+        return state_bounded
     
     def forward(self, x):
         # LSTM encoding
@@ -195,9 +193,9 @@ class VehicleLSTMMPC(nn.Module):
         target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2 * num_targets)
         
         # Combine state and control targets
-        target = torch.cat([target_state, target_control], dim=1)  # (batch_size, 6 * num_targets)
-        
-        return state_weights, control_weights, target
+        target = torch.cat([target_state, target_control], dim=2)  # (batch_size, num_targets, 6)
+
+        return state_weights, control_weights, target.view(target.size(0), -1)
 
 class VehicleMPCSolver:
     """MPC solver using mpc.pytorch library with kinematic bicycle model and multiple targets"""
@@ -528,7 +526,7 @@ class VehicleLSTMMPCTrainer:
         regularization = state_weight_reg + control_weight_reg + target_reg
         
         # Total loss
-        total_loss = trajectory_loss + 0.0 * control_loss + 0.0000 * regularization
+        total_loss = trajectory_loss + 0.0 * control_loss + 0.01 * regularization
 
         return {
             'total': total_loss,
@@ -969,7 +967,7 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='test',
+    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='train',
                        help='Mode: train, test, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
@@ -1030,7 +1028,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(5000, 10000):
+        for i in range(6050, 10000):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
