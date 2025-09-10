@@ -182,8 +182,10 @@ class VehicleLSTMMPC(nn.Module):
         
         # Predict MPC parameters
         state_weights = self.state_weight_head(last_hidden)  # (batch_size, 4)
+
+
         control_weights = self.control_weight_head(last_hidden)  # (batch_size, 2)
-        
+
         # Predict targets separately - now multiple targets
         target_state_raw = self.target_state_head(last_hidden)  # (batch_size, 4 * num_targets)
         target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2 * num_targets)
@@ -957,7 +959,7 @@ def main():
     # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
-    parser.add_argument('--num_targets', type=int, default=2, 
+    parser.add_argument('--num_targets', type=int, default=1, 
                        help='Number of target points to use across MPC horizon')
     
     # Training parameters
@@ -1028,7 +1030,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(6050, 10000):
+        for i in range(8200, 10000):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
