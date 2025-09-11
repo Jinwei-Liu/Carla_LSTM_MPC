@@ -14,8 +14,8 @@ class Kinematic_Bicycle_MPC(nn.Module):
         self._lf = lf
         
         # 动作限制
-        self.a_min = -2.0  # 最小加速度 (m/s²)
-        self.a_max = 2.0   # 最大加速度 (m/s²)
+        self.a_min = -10.0  # 最小加速度 (m/s²)
+        self.a_max = 10.0   # 最大加速度 (m/s²)
         self.delta_f_min = -np.deg2rad(70)  # 最小前轮转向角 (rad)
         self.delta_f_max = np.deg2rad(70)   # 最大前轮转向角 (rad)
         

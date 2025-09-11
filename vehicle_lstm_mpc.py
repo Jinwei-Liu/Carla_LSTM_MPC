@@ -1030,7 +1030,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(8200, 10000):
+        for i in range(6800, 10000, 10):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data

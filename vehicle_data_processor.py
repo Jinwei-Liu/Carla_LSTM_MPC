@@ -65,8 +65,8 @@ class VehicleDataProcessor:
         cos_yaw = np.cos(-yaw_current)
         sin_yaw = np.sin(-yaw_current)
         
-        x_translated = relative_states[:, 0]
-        y_translated = relative_states[:, 1]
+        x_translated = relative_states[:, 0].copy()  # 创建副本
+        y_translated = relative_states[:, 1].copy()  # 创建副本
         
         # 旋转变换
         relative_states[:, 0] = x_translated * cos_yaw - y_translated * sin_yaw

@@ -2,3 +2,4 @@ collected_data/
 vehicle_datasets/
 models/
 test.py
+show_data.py
