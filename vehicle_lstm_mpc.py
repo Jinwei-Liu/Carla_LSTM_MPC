@@ -1,6 +1,6 @@
 """
-Vehicle LSTM-MPC Controller for CARLA with Multiple Target Points
-Modified to support multiple target points across the MPC horizon
+Vehicle LSTM-MPC Controller for CARLA with Multiple Target Points and Cost Probability Heatmap Visualization
+Modified to support multiple target points across the MPC horizon with enhanced probability visualization
 """
 
 import torch
@@ -9,6 +9,10 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.patches as patches
+from matplotlib.patches import Ellipse
+from matplotlib.colorbar import ColorbarBase
 import pickle
 import argparse
 from tqdm import tqdm
@@ -71,7 +75,7 @@ class VehicleLSTMMPCDataset(Dataset):
         }
 
 class VehicleLSTMMPC(nn.Module):
-    """LSTM network for predicting MPC parameters with multiple targets"""
+    """LSTM network for predicting MPC parameters with decoder-based target prediction"""
     
     def __init__(self, 
                  input_dim=6,      # [x, y, yaw, speed, a, delta_f]
@@ -113,33 +117,29 @@ class VehicleLSTMMPC(nn.Module):
             nn.Softplus()  # Ensure positive weights
         )
         
-        # Target state prediction head - now outputs multiple targets
-        self.target_state_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+        # NEW: Decoder LSTM for target prediction
+        self.target_decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, 
+                                          batch_first=True)
+        
+        # NEW: Output heads for decoder (now single target per timestep)
+        self.target_state_fc = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, state_dim * num_targets)  # Output multiple targets
+            nn.Linear(32, state_dim)  # Output single target state per timestep
         )
         
-        # Target control prediction head - now outputs multiple targets
-        self.target_control_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+        self.target_control_fc = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
             nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, control_dim * num_targets)  # Output multiple targets
+            nn.Linear(32, control_dim)  # Output single target control per timestep
         )
     
     def apply_control_bounds(self, control_raw):
         """Apply bounds to control outputs using tanh activation"""
-        # Reshape to handle multiple targets: (batch_size, num_targets, control_dim)
-        batch_size = control_raw.size(0)
-        control_reshaped = control_raw.view(batch_size, self.num_targets, self.control_dim)
-        
+        # Now control_raw is (batch_size, num_targets, control_dim)
         # Split the control outputs
-        a_raw = control_reshaped[:, :, 0:1]  # acceleration
-        delta_f_raw = control_reshaped[:, :, 1:2]  # steering angle
+        a_raw = control_raw[:, :, 0:1]  # acceleration
+        delta_f_raw = control_raw[:, :, 1:2]  # steering angle
         
         # Apply bounds using tanh
         a_bounded = torch.tanh(a_raw) * self.a_bound
@@ -152,15 +152,12 @@ class VehicleLSTMMPC(nn.Module):
     
     def apply_state_bounds(self, state_raw):
         """Apply bounds to state outputs, specifically for yaw angle"""
-        # Reshape to handle multiple targets: (batch_size, num_targets, state_dim)
-        batch_size = state_raw.size(0)
-        state_reshaped = state_raw.view(batch_size, self.num_targets, self.state_dim)
-        
+        # Now state_raw is (batch_size, num_targets, state_dim)
         # Split the state outputs: [x, y, yaw, speed]
-        x = state_reshaped[:, :, 0:1]      # x position (no bounds)
-        y = state_reshaped[:, :, 1:2]      # y position (no bounds) 
-        yaw_raw = state_reshaped[:, :, 2:3]    # yaw angle (需要限制)
-        speed_raw = state_reshaped[:, :, 3:4]  # speed (限制为正值)
+        x = state_raw[:, :, 0:1]      # x position (no bounds)
+        y = state_raw[:, :, 1:2]      # y position (no bounds) 
+        yaw_raw = state_raw[:, :, 2:3]    # yaw angle (需要限制)
+        speed_raw = state_raw[:, :, 3:4]  # speed (限制为正值)
         
         # Apply yaw angle bounds: limit to [-π, π]
         yaw_bounded = torch.atan2(torch.sin(yaw_raw), torch.cos(yaw_raw))
@@ -173,31 +170,47 @@ class VehicleLSTMMPC(nn.Module):
         
         return state_bounded
     
+    def decode_targets(self, context):
+        """Decode targets using LSTM decoder"""
+        batch_size = context.size(0)
+        
+        # Expand context to all target timesteps
+        decoder_input = context.unsqueeze(1).repeat(1, self.num_targets, 1)  # (batch, num_targets, hidden_dim)
+        
+        # Pass through decoder LSTM
+        decoder_out, _ = self.target_decoder_lstm(decoder_input)  # (batch, num_targets, hidden_dim)
+        
+        # Generate target states and controls for each timestep
+        target_states_raw = self.target_state_fc(decoder_out)  # (batch, num_targets, state_dim)
+        target_controls_raw = self.target_control_fc(decoder_out)  # (batch, num_targets, control_dim)
+        
+        # Apply bounds
+        target_states = self.apply_state_bounds(target_states_raw)
+        target_controls = self.apply_control_bounds(target_controls_raw)
+        
+        return target_states, target_controls
+    
     def forward(self, x):
         # LSTM encoding
         lstm_out, (hidden, cell) = self.lstm(x)
         
         # Use last hidden state
         last_hidden = lstm_out[:, -1, :]  # (batch_size, hidden_dim)
-        
+
         # Predict MPC parameters
         state_weights = self.state_weight_head(last_hidden)  # (batch_size, 4)
-
-
-        control_weights = self.control_weight_head(last_hidden)  # (batch_size, 2)
-
-        # Predict targets separately - now multiple targets
-        target_state_raw = self.target_state_head(last_hidden)  # (batch_size, 4 * num_targets)
-        target_control_raw = self.target_control_head(last_hidden)  # (batch_size, 2 * num_targets)
+        control_weights = self.control_weight_head(last_hidden) # (batch_size, 2)
         
-        # Apply bounds to targets
-        target_state = self.apply_state_bounds(target_state_raw)  # (batch_size, 4 * num_targets)
-        target_control = self.apply_control_bounds(target_control_raw)  # (batch_size, 2 * num_targets)
+        # NEW: Decode targets using LSTM decoder
+        target_states, target_controls = self.decode_targets(last_hidden)  # (batch, num_targets, state_dim), (batch, num_targets, control_dim)
         
         # Combine state and control targets
-        target = torch.cat([target_state, target_control], dim=2)  # (batch_size, num_targets, 6)
-
-        return state_weights, control_weights, target.view(target.size(0), -1)
+        target = torch.cat([target_states, target_controls], dim=2)  # (batch_size, num_targets, 6)
+        
+        # Flatten for compatibility with existing code
+        target_flat = target.view(target.size(0), -1)  # (batch_size, num_targets * 6)
+        
+        return state_weights, control_weights, target_flat
 
 class VehicleMPCSolver:
     """MPC solver using mpc.pytorch library with kinematic bicycle model and multiple targets"""
@@ -523,7 +536,7 @@ class VehicleLSTMMPCTrainer:
         # Parameter regularization
         state_weight_reg = torch.mean((state_weights - 0.0).pow(2))
         control_weight_reg = torch.mean((control_weights - 0.0).pow(2))
-        target_reg = torch.mean(target.pow(2)) * 0.01
+        target_reg = torch.mean(target.pow(2)) * 0.0
         
         regularization = state_weight_reg + control_weight_reg + target_reg
         
@@ -570,7 +583,7 @@ class VehicleLSTMMPCTrainer:
                 val_reg_loss / len(val_loader))
 
 class VehicleLSTMMPCPredictor:
-    """Online predictor for vehicle control with multiple targets support"""
+    """Online predictor for vehicle control with multiple targets support and cost probability heatmap visualization"""
     
     def __init__(self, model_path, device='cpu', horizon=100):
         self.device = device
@@ -663,8 +676,373 @@ class VehicleLSTMMPCPredictor:
         
         return optimal_controls, predicted_states, mpc_params
     
+    def calculate_mpc_costs(self, predicted_states, optimal_controls, mpc_params):
+        """
+        计算MPC轨迹上每个点的cost详细信息
+        
+        Args:
+            predicted_states: MPC预测的状态轨迹 (T, 4)
+            optimal_controls: MPC预测的控制轨迹 (T, 2) 
+            mpc_params: MPC参数字典
+        
+        Returns:
+            cost_breakdown: 每个时间步的cost分解
+        """
+        state_weights = mpc_params['state_weights']
+        control_weights = mpc_params['control_weights']
+        targets = mpc_params['targets']
+        
+        T = len(predicted_states)
+        cost_breakdown = {
+            'total_cost': np.zeros(T),
+            'state_cost': np.zeros(T),
+            'control_cost': np.zeros(T),
+            'position_cost': np.zeros(T),
+            'yaw_cost': np.zeros(T), 
+            'speed_cost': np.zeros(T),
+            'accel_cost': np.zeros(T),
+            'steer_cost': np.zeros(T)
+        }
+        
+        # 为每个时间步分配目标（简化：使用第一个目标）
+        if targets:
+            target_state = targets[0]['state']  # [x, y, yaw, speed]
+            target_control = targets[0]['control']  # [a, delta_f]
+        else:
+            target_state = np.zeros(4)
+            target_control = np.zeros(2)
+        
+        for t in range(T):
+            # 状态误差
+            state_error = predicted_states[t] - target_state
+            control_error = optimal_controls[t] - target_control
+            
+            # 各分量的cost
+            position_cost = state_weights[0] * (state_error[0]**2) + state_weights[1] * (state_error[1]**2)
+            yaw_cost = state_weights[2] * (state_error[2]**2)
+            speed_cost = state_weights[3] * (state_error[3]**2)
+            
+            accel_cost = control_weights[0] * (control_error[0]**2)
+            steer_cost = control_weights[1] * (control_error[1]**2)
+            
+            # 存储结果
+            cost_breakdown['position_cost'][t] = position_cost
+            cost_breakdown['yaw_cost'][t] = yaw_cost
+            cost_breakdown['speed_cost'][t] = speed_cost
+            cost_breakdown['accel_cost'][t] = accel_cost
+            cost_breakdown['steer_cost'][t] = steer_cost
+            
+            cost_breakdown['state_cost'][t] = position_cost + yaw_cost + speed_cost
+            cost_breakdown['control_cost'][t] = accel_cost + steer_cost
+            cost_breakdown['total_cost'][t] = cost_breakdown['state_cost'][t] + cost_breakdown['control_cost'][t]
+        
+        return cost_breakdown
+    
+    def _plot_cost_probability_heatmap(self, ax, predicted_states, cost_breakdown):
+        """
+        绘制基于cost的概率热力图
+        cost越低的位置，概率权重越高（更"可能"被选中）
+        """
+        x = predicted_states[:, 0]
+        y = predicted_states[:, 1] 
+        cost = cost_breakdown['total_cost']
+        
+        # 将cost转换为概率权重 (cost越低，权重越高)
+        # 使用softmax的逆向思维：cost越高，概率越低
+        weights = np.exp(-cost / (np.std(cost) + 1e-8))  # 负指数变换
+        weights = weights / np.sum(weights)  # 归一化为概率
+        
+        # 创建更精细的网格
+        x_min, x_max = np.min(x), np.max(x)
+        y_min, y_max = np.min(y), np.max(y)
+        
+        # 扩展边界以便更好地显示
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        x_min -= x_range * 0.1
+        x_max += x_range * 0.1
+        y_min -= y_range * 0.1
+        y_max += y_range * 0.1
+        
+        # 创建网格
+        grid_size = 100
+        xi = np.linspace(x_min, x_max, grid_size)
+        yi = np.linspace(y_min, y_max, grid_size)
+        xi_mesh, yi_mesh = np.meshgrid(xi, yi)
+        
+        # 计算每个网格点的概率密度
+        # 使用高斯核密度估计的思想
+        sigma = min(x_range, y_range) * 0.05  # 核函数的标准差
+        probability_map = np.zeros((grid_size, grid_size))
+        
+        for i in range(len(x)):
+            # 计算每个轨迹点对网格的影响
+            distances_sq = (xi_mesh - x[i])**2 + (yi_mesh - y[i])**2
+            influence = weights[i] * np.exp(-distances_sq / (2 * sigma**2))
+            probability_map += influence
+        
+        # 归一化概率图
+        if np.sum(probability_map) > 0:
+            probability_map = probability_map / np.sum(probability_map)
+        
+        # 绘制概率热力图
+        levels = np.linspace(0, np.max(probability_map), 20)
+        contour = ax.contourf(xi_mesh, yi_mesh, probability_map, levels=levels, 
+                             cmap='YlOrRd', alpha=0.8)
+        
+        # 添加等概率线
+        contour_lines = ax.contour(xi_mesh, yi_mesh, probability_map, levels=8, 
+                                  colors='black', alpha=0.3, linewidths=0.5)
+        
+        # 绘制轨迹点，大小表示概率权重
+        scatter = ax.scatter(x, y, c=weights, s=weights*1000, cmap='YlOrRd', 
+                            edgecolors='black', linewidth=0.5, alpha=0.7)
+        
+        # 绘制轨迹线
+        ax.plot(x, y, 'k--', alpha=0.6, linewidth=1, label='Trajectory')
+        
+        # 添加colorbar
+        cbar = plt.colorbar(contour, ax=ax, shrink=0.8)
+        cbar.set_label('Probability Density', rotation=270, labelpad=15)
+        
+        # 标注高概率区域
+        max_prob_idx = np.unravel_index(np.argmax(probability_map), probability_map.shape)
+        max_prob_x = xi_mesh[max_prob_idx]
+        max_prob_y = yi_mesh[max_prob_idx]
+        ax.plot(max_prob_x, max_prob_y, 'w*', markersize=15, 
+               markeredgecolor='black', markeredgewidth=1, label='Peak Probability')
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('Cost-based Trajectory Probability Heatmap')
+        ax.legend()
+        ax.axis('equal')
+        ax.grid(True, alpha=0.3)
+    
+    def visualize_prediction_with_heatmap(self, hist_states, predicted_states, true_states=None, mpc_params=None):
+        """
+        增强版可视化：包含cost概率热力图
+        """
+        # 计算cost详情
+        dt = mpc_params.get('mpc_dt', 0.05)
+        
+        # 简化：从状态变化推算控制量
+        controls_approx = np.zeros((len(predicted_states), 2))
+        for i in range(len(predicted_states)-1):
+            # 加速度近似
+            controls_approx[i, 0] = (predicted_states[i+1, 3] - predicted_states[i, 3]) / dt
+            # 转向角近似（从偏航角变化率推算）
+            if predicted_states[i, 3] > 0.1:
+                controls_approx[i, 1] = (predicted_states[i+1, 2] - predicted_states[i, 2]) / dt * 3.45 / predicted_states[i, 3]
+            else:
+                controls_approx[i, 1] = 0
+        
+        cost_breakdown = self.calculate_mpc_costs(predicted_states, controls_approx, mpc_params)
+        
+        # 创建图形
+        fig = plt.figure(figsize=(20, 15))
+        
+        # 1. 主轨迹图 - 带总cost热力图
+        ax1 = plt.subplot(3, 4, (1, 2))
+        self._plot_trajectory_heatmap(ax1, hist_states, predicted_states, true_states, 
+                                     cost_breakdown['total_cost'], 'Total Cost Heatmap', mpc_params)
+        
+        # 2. 位置cost热力图
+        ax2 = plt.subplot(3, 4, 3)
+        self._plot_trajectory_heatmap(ax2, hist_states, predicted_states, true_states,
+                                     cost_breakdown['position_cost'], 'Position Cost', mpc_params, compact=True)
+        
+        # 3. 速度cost热力图  
+        ax3 = plt.subplot(3, 4, 4)
+        self._plot_trajectory_heatmap(ax3, hist_states, predicted_states, true_states,
+                                     cost_breakdown['speed_cost'], 'Speed Cost', mpc_params, compact=True)
+        
+        # 4. Cost随时间变化
+        ax4 = plt.subplot(3, 4, (5, 6))
+        self._plot_cost_timeline(ax4, cost_breakdown, mpc_params)
+        
+        # 5. 控制量cost热力图
+        ax5 = plt.subplot(3, 4, 7)
+        self._plot_trajectory_heatmap(ax5, hist_states, predicted_states, true_states,
+                                     cost_breakdown['control_cost'], 'Control Cost', mpc_params, compact=True)
+        
+        # 6. 偏航角cost热力图
+        ax6 = plt.subplot(3, 4, 8)
+        self._plot_trajectory_heatmap(ax6, hist_states, predicted_states, true_states,
+                                     cost_breakdown['yaw_cost'], 'Yaw Cost', mpc_params, compact=True)
+        
+        # 7. Cost分量饼图
+        ax7 = plt.subplot(3, 4, 9)
+        self._plot_cost_breakdown_pie(ax7, cost_breakdown)
+        
+        # 8. MPC权重可视化
+        ax8 = plt.subplot(3, 4, 10)
+        self._plot_mpc_weights(ax8, mpc_params)
+        
+        # 9. Cost概率分布热力图（固定使用probability样式）
+        ax9 = plt.subplot(3, 4, 11)
+        self._plot_cost_probability_heatmap(ax9, predicted_states, cost_breakdown)
+        
+        # 10. Cost统计信息
+        ax10 = plt.subplot(3, 4, 12)
+        self._plot_cost_statistics(ax10, cost_breakdown)
+        
+        plt.tight_layout()
+        plt.suptitle(f'MPC Cost Analysis with Probability Heatmap (DS={mpc_params.get("downsample_factor", 1)}, Targets={mpc_params.get("num_targets", 1)})', 
+                     fontsize=16, y=0.98)
+        plt.show()
+    
+    def _plot_trajectory_heatmap(self, ax, hist_states, pred_states, true_states, cost_values, title, mpc_params, compact=False):
+        """绘制轨迹热力图"""
+        # 历史轨迹
+        ax.plot(hist_states[:, 0], hist_states[:, 1], 'b-', linewidth=3, label='History', alpha=0.8)
+        
+        # 真实轨迹
+        if true_states is not None:
+            ax.plot(true_states[:, 0], true_states[:, 1], 'g-', linewidth=2, label='Ground Truth', alpha=0.7)
+        
+        # 预测轨迹 - 用cost值着色
+        if len(cost_values) > 0:
+            # 归一化cost值到[0,1]
+            cost_norm = (cost_values - np.min(cost_values)) / (np.ptp(cost_values) + 1e-8)
+            
+            # 创建热力图颜色映射
+            cmap = plt.cm.Reds  # 红色表示高cost
+            
+            # 绘制轨迹点，颜色表示cost
+            scatter = ax.scatter(pred_states[:, 0], pred_states[:, 1], 
+                               c=cost_norm, cmap=cmap, s=50, alpha=0.8, 
+                               edgecolors='darkred', linewidth=0.5)
+            
+            # 连接线
+            ax.plot(pred_states[:, 0], pred_states[:, 1], 'r--', linewidth=1.5, alpha=0.6)
+            
+            # 添加颜色条
+            if not compact:
+                cbar = plt.colorbar(scatter, ax=ax, shrink=0.6)
+                cbar.set_label('Cost Value', rotation=270, labelpad=15)
+        
+        # 绘制目标点
+        if mpc_params and 'targets' in mpc_params:
+            colors = ['red', 'orange', 'purple', 'brown', 'pink']
+            for i, target_info in enumerate(mpc_params['targets']):
+                target_state = target_info['state']
+                color = colors[i % len(colors)]
+                ax.plot(target_state[0], target_state[1], '*', markersize=12 if compact else 15, 
+                       color=color, label=f'Target {i+1}' if not compact else None,
+                       markeredgecolor='black', markeredgewidth=1)
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title(title)
+        if not compact:
+            ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.axis('equal')
+
+    def _plot_cost_timeline(self, ax, cost_breakdown, mpc_params):
+        """绘制cost随时间变化"""
+        mpc_dt = mpc_params.get('mpc_dt', 0.05)
+        time = np.arange(len(cost_breakdown['total_cost'])) * mpc_dt
+        
+        ax.plot(time, cost_breakdown['total_cost'], 'k-', linewidth=3, label='Total Cost')
+        ax.plot(time, cost_breakdown['state_cost'], 'b--', linewidth=2, label='State Cost')  
+        ax.plot(time, cost_breakdown['control_cost'], 'r--', linewidth=2, label='Control Cost')
+        ax.fill_between(time, cost_breakdown['position_cost'], alpha=0.3, label='Position')
+        ax.fill_between(time, cost_breakdown['speed_cost'], alpha=0.3, label='Speed')
+        
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Cost Value')
+        ax.set_title('Cost Evolution Over Time')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    def _plot_cost_breakdown_pie(self, ax, cost_breakdown):
+        """绘制cost分量饼图"""
+        # 计算各分量的平均cost
+        avg_costs = {
+            'Position': np.mean(cost_breakdown['position_cost']),
+            'Yaw': np.mean(cost_breakdown['yaw_cost']),
+            'Speed': np.mean(cost_breakdown['speed_cost']),
+            'Acceleration': np.mean(cost_breakdown['accel_cost']),
+            'Steering': np.mean(cost_breakdown['steer_cost'])
+        }
+        
+        # 过滤掉接近零的值
+        filtered_costs = {k: v for k, v in avg_costs.items() if v > 1e-6}
+        
+        if filtered_costs:
+            labels = list(filtered_costs.keys())
+            sizes = list(filtered_costs.values())
+            colors = ['lightcoral', 'skyblue', 'lightgreen', 'gold', 'plum']
+            
+            ax.pie(sizes, labels=labels, colors=colors[:len(labels)], autopct='%1.1f%%', startangle=90)
+            ax.set_title('Average Cost Breakdown')
+        else:
+            ax.text(0.5, 0.5, 'No significant\ncost variation', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('Cost Breakdown')
+
+    def _plot_mpc_weights(self, ax, mpc_params):
+        """绘制MPC权重"""
+        if mpc_params:
+            weights_labels = ['X', 'Y', 'Yaw', 'Speed', 'Accel', 'Steer']
+            weights_values = list(mpc_params['state_weights']) + list(mpc_params['control_weights'])
+            
+            colors = ['lightblue', 'lightblue', 'lightgreen', 'lightgreen', 'orange', 'orange']
+            bars = ax.bar(weights_labels, weights_values, color=colors, alpha=0.7, edgecolor='black')
+            
+            ax.set_ylabel('Weight Value')
+            ax.set_title('MPC Weights')
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # 添加数值标签
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+
+    def _plot_cost_statistics(self, ax, cost_breakdown):
+        """绘制cost统计信息"""
+        ax.axis('off')
+        
+        # 计算统计量
+        total_cost = np.sum(cost_breakdown['total_cost'])
+        max_cost = np.max(cost_breakdown['total_cost'])
+        mean_cost = np.mean(cost_breakdown['total_cost'])
+        std_cost = np.std(cost_breakdown['total_cost'])
+        
+        # 找到最高cost的时间点
+        max_cost_idx = np.argmax(cost_breakdown['total_cost'])
+        
+        stats_text = f"""
+    Cost Statistics:
+
+    Total Cost: {total_cost:.3f}
+    Maximum Cost: {max_cost:.3f} (at step {max_cost_idx})
+    Average Cost: {mean_cost:.3f}
+    Cost Std Dev: {std_cost:.3f}
+
+    Cost Distribution:
+    • State Cost: {np.mean(cost_breakdown['state_cost']):.3f}
+    • Control Cost: {np.mean(cost_breakdown['control_cost']):.3f}
+    • Position Cost: {np.mean(cost_breakdown['position_cost']):.3f}
+    • Speed Cost: {np.mean(cost_breakdown['speed_cost']):.3f}
+    • Yaw Cost: {np.mean(cost_breakdown['yaw_cost']):.3f}
+
+    High Cost Regions:
+    • Steps with cost > mean+std: {np.sum(cost_breakdown['total_cost'] > mean_cost + std_cost)}
+    • Peak cost location: step {max_cost_idx}
+
+    Probability Heatmap Info:
+    • Blue regions: High probability (Low cost)
+    • Red regions: Low probability (High cost)  
+        """
+        
+        ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=10,
+               verticalalignment='top', bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
+    
     def visualize_prediction(self, hist_states, predicted_states, true_states=None, mpc_params=None):
-        """Visualize prediction results with multiple targets"""
+        """Visualize prediction results with multiple targets (original simple version)"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         
         # Trajectory plot
@@ -944,7 +1322,7 @@ def load_dataset_from_folder(data_folder, dataset_name):
     return dataset
 
 def main():
-    parser = argparse.ArgumentParser(description='Vehicle LSTM-MPC Training and Prediction with Multiple Targets')
+    parser = argparse.ArgumentParser(description='Vehicle LSTM-MPC Training and Prediction with Cost Probability Heatmap')
     
     # Data parameters
     parser.add_argument('--data_folder', default='vehicle_datasets', help='Folder containing datasets')
@@ -952,6 +1330,7 @@ def main():
     parser.add_argument('--test_file', default='vehicle_test_dataset.pkl', help='Test dataset')
     
     # Model parameters
+    
     parser.add_argument('--save_dir', default='models', help='Model save directory')
     parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
@@ -959,7 +1338,7 @@ def main():
     # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
-    parser.add_argument('--num_targets', type=int, default=1, 
+    parser.add_argument('--num_targets', type=int, default=5, 
                        help='Number of target points to use across MPC horizon')
     
     # Training parameters
@@ -967,7 +1346,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
-    
+     
     # Run mode
     parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='train',
                        help='Mode: train, test, or evaluate')
@@ -977,7 +1356,7 @@ def main():
     
     os.makedirs(args.save_dir, exist_ok=True)
     
-    print(f"=== Vehicle LSTM-MPC Controller with Multiple Targets ===")
+    print(f"=== Vehicle LSTM-MPC Controller with Cost Probability Heatmap ===")
     print(f"Mode: {args.mode}")
     print(f"Downsample Factor: {args.downsample_factor}")
     print(f"Number of Targets: {args.num_targets}")
@@ -1030,7 +1409,7 @@ def main():
         predictor = VehicleLSTMMPCPredictor(model_path)
         
         # Test samples
-        for i in range(6800, 10000, 10):
+        for i in range(0, 10000, 100):
             seq = test_dataset_full['training_sequences'][i]
             
             # Prepare data
@@ -1062,17 +1441,28 @@ def main():
             print(f"  MPC dt: {mpc_params['mpc_dt']:.2f}s")
             print(f"  MPC horizon: {mpc_params['mpc_horizon']} steps")
             
-            # Visualize
             # For comparison, downsample ground truth
             ds_indices = np.arange(0, len(future_states), predictor.downsample_factor)
             downsampled_future_states = future_states[ds_indices[:len(predicted_states)]]
             
-            predictor.visualize_prediction(
+            # Use the cost probability heatmap visualization
+            print(f"  Generating cost probability heatmap visualization...")
+            predictor.visualize_prediction_with_heatmap(
                 hist_states, 
                 predicted_states, 
                 downsampled_future_states,
                 mpc_params
             )
+            
+            # Optional: Also show the original simple visualization for comparison
+            show_simple_viz = input("Show simple visualization too? (y/n): ").lower().strip()
+            if show_simple_viz == 'y':
+                predictor.visualize_prediction(
+                    hist_states, 
+                    predicted_states, 
+                    downsampled_future_states,
+                    mpc_params
+                )
     
     elif args.mode == 'evaluate':
         print("Loading test dataset and model...")

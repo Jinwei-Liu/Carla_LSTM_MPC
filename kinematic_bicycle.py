@@ -32,12 +32,20 @@ class Kinematic_Bicycle_MPC(nn.Module):
         return torch.cat([a_clipped, delta_f_clipped], dim=-1)
         
     def forward(self, X, action):
+        """使用四阶龙格库塔方法进行状态积分"""
         # 首先限制动作范围
         action_clipped = self.clip_action(action)
         
         DT = self._dt
-        k1 = DT * self._f(X, action_clipped)
-        X_next = X + k1
+        
+        # 四阶龙格库塔积分
+        k1 = self._f(X, action_clipped)
+        k2 = self._f(X + 0.5 * DT * k1, action_clipped)
+        k3 = self._f(X + 0.5 * DT * k2, action_clipped)
+        k4 = self._f(X + DT * k3, action_clipped)
+        
+        # RK4公式：X_next = X + (DT/6) * (k1 + 2*k2 + 2*k3 + k4)
+        X_next = X + (DT / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         
         # 对航向角psi进行角度归一化，限制在[-π, π]范围内
         X_next = self._normalize_angle(X_next)
@@ -123,9 +131,9 @@ class Kinematic_Bicycle_MPC(nn.Module):
         # Discretization
         eye = torch.eye(self.s_dim, dtype=X.dtype, device=X.device)
         eye = eye.expand(*batch_shape, -1, -1)
-        A_d = eye + DT * A
-        B_d = DT * B
-        
+        A_d = eye + A
+        B_d = B
+
         return A_d, B_d
     
     def get_beta(self, delta_f):
