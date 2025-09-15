@@ -1,6 +1,7 @@
 """
 Vehicle LSTM-MPC Controller for CARLA with Multiple Target Points and Cost Probability Heatmap Visualization
 Modified to support multiple target points across the MPC horizon with enhanced probability visualization
+Now includes lqr_iter as a configurable parameter
 """
 
 import torch
@@ -215,7 +216,7 @@ class VehicleLSTMMPC(nn.Module):
 class VehicleMPCSolver:
     """MPC solver using mpc.pytorch library with kinematic bicycle model and multiple targets"""
     
-    def __init__(self, dt=0.05, horizon=100, device='cuda', downsample_factor=1, num_targets=1):
+    def __init__(self, dt=0.05, horizon=100, device='cuda', downsample_factor=1, num_targets=1, lqr_iter=30):
         """
         Args:
             dt: Original sampling time (0.05s)
@@ -223,6 +224,7 @@ class VehicleMPCSolver:
             device: Computing device
             downsample_factor: Factor to downsample MPC computation
             num_targets: Number of target points to use
+            lqr_iter: Number of LQR iterations for MPC solver
         """
         self.original_dt = dt
         self.downsample_factor = downsample_factor
@@ -230,6 +232,7 @@ class VehicleMPCSolver:
         self.mpc_horizon = horizon // downsample_factor + 1  # Downsampled horizon
         self.device = device
         self.num_targets = num_targets
+        self.lqr_iter = lqr_iter  # Store lqr_iter parameter
         
         # Create kinematic bicycle model with MPC sampling time
         self.model = Kinematic_Bicycle_MPC(dt=self.mpc_dt)
@@ -245,6 +248,7 @@ class VehicleMPCSolver:
         print(f"  Downsample factor: {self.downsample_factor}")
         print(f"  MPC horizon: {self.mpc_horizon} steps")
         print(f"  Number of targets: {self.num_targets}")
+        print(f"  LQR iterations: {self.lqr_iter}")
         
     def distribute_targets_across_horizon(self, targets):
         """
@@ -320,12 +324,12 @@ class VehicleMPCSolver:
         # Create QuadCost object
         cost = QuadCost(C, c)
         
-        # Setup MPC controller
+        # Setup MPC controller with configurable lqr_iter
         ctrl = mpc.MPC(
             n_state=self.n_state,
             n_ctrl=self.n_ctrl,
             T=self.mpc_horizon,
-            lqr_iter=30,
+            lqr_iter=self.lqr_iter,  # Use the configurable parameter
             grad_method=GradMethods.ANALYTIC,
             exit_unconverged=False,
             detach_unconverged=False,
@@ -346,28 +350,30 @@ class VehicleLSTMMPCTrainer:
     """Trainer for Vehicle LSTM-MPC model with multiple targets support"""
     
     def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu', 
-                 downsample_factor=1, num_targets=1):
+                 downsample_factor=1, num_targets=1, lqr_iter=30):
         self.model = model.to(device)
         self.device = device
         self.downsample_factor = downsample_factor
         self.num_targets = num_targets
+        self.lqr_iter = lqr_iter
         self.train_losses = []
         self.val_losses = []
         
-        # MPC solver with downsampling and multiple targets
+        # MPC solver with downsampling, multiple targets, and lqr_iter
         self.mpc_solver = VehicleMPCSolver(
             dt=0.05, 
             horizon=100, 
             device=device,
             downsample_factor=downsample_factor,
-            num_targets=num_targets
+            num_targets=num_targets,
+            lqr_iter=lqr_iter
         )
         
         # Loss functions
         self.mse_loss = nn.MSELoss()
         self.l1_loss = nn.L1Loss()
         
-        print(f"Trainer initialized with downsample_factor={downsample_factor}, num_targets={num_targets}")
+        print(f"Trainer initialized with downsample_factor={downsample_factor}, num_targets={num_targets}, lqr_iter={lqr_iter}")
         
     def train_model(self, train_loader, val_loader, epochs=100, lr=1e-3, patience=15, save_dir='models'):
         
@@ -383,6 +389,7 @@ class VehicleLSTMMPCTrainer:
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(f"Downsample factor: {self.downsample_factor}")
         print(f"Number of targets: {self.num_targets}")
+        print(f"LQR iterations: {self.lqr_iter}")
         
         for epoch in range(epochs):
             # Training phase
@@ -444,7 +451,7 @@ class VehicleLSTMMPCTrainer:
                 best_val_loss = val_loss
                 patience_counter = 0
                 
-                model_path = os.path.join(save_dir, f'best_vehicle_lstm_mpc_ds{self.downsample_factor}_targets{self.num_targets}.pth')
+                model_path = os.path.join(save_dir, f'best_vehicle_lstm_mpc_ds{self.downsample_factor}_targets{self.num_targets}_lqr{self.lqr_iter}.pth')
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -458,6 +465,7 @@ class VehicleLSTMMPCTrainer:
                     },
                     'downsample_factor': self.downsample_factor,
                     'num_targets': self.num_targets,
+                    'lqr_iter': self.lqr_iter,
                     'epoch': epoch,
                     'val_loss': val_loss,
                     'train_losses': self.train_losses,
@@ -585,7 +593,7 @@ class VehicleLSTMMPCTrainer:
 class VehicleLSTMMPCPredictor:
     """Online predictor for vehicle control with multiple targets support and cost probability heatmap visualization"""
     
-    def __init__(self, model_path, device='cpu', horizon=100):
+    def __init__(self, model_path, device='cpu', horizon=100, lqr_iter=None):
         self.device = device
         self.horizon = horizon
         
@@ -598,6 +606,8 @@ class VehicleLSTMMPCPredictor:
         # Get parameters
         self.downsample_factor = checkpoint.get('downsample_factor', 1)
         self.num_targets = checkpoint.get('num_targets', 1)
+        # Use lqr_iter from checkpoint if not provided
+        self.lqr_iter = lqr_iter if lqr_iter is not None else checkpoint.get('lqr_iter', 30)
         
         # Rebuild model
         config = checkpoint['model_config']
@@ -614,19 +624,21 @@ class VehicleLSTMMPCPredictor:
         self.model.to(device)
         self.model.eval()
         
-        # MPC solver with multiple targets
+        # MPC solver with multiple targets and lqr_iter
         self.mpc_solver = VehicleMPCSolver(
             dt=0.05, 
             horizon=horizon, 
             device=device,
             downsample_factor=self.downsample_factor,
-            num_targets=self.num_targets
+            num_targets=self.num_targets,
+            lqr_iter=self.lqr_iter
         )
         
         print(f"Model loaded from {model_path}")
         print(f"Validation loss: {checkpoint['val_loss']:.6f}")
         print(f"Downsample factor: {self.downsample_factor}")
         print(f"Number of targets: {self.num_targets}")
+        print(f"LQR iterations: {self.lqr_iter}")
     
     def predict_control(self, hist_states, hist_actions, current_state):
         """
@@ -1330,9 +1342,8 @@ def main():
     parser.add_argument('--test_file', default='vehicle_test_dataset.pkl', help='Test dataset')
     
     # Model parameters
-    
     parser.add_argument('--save_dir', default='models', help='Model save directory')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
     
     # MPC parameters
@@ -1340,6 +1351,8 @@ def main():
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
     parser.add_argument('--num_targets', type=int, default=10, 
                        help='Number of target points to use across MPC horizon')
+    parser.add_argument('--lqr_iter', type=int, default=30,
+                       help='Number of LQR iterations for MPC solver (default: 30)')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
@@ -1360,6 +1373,7 @@ def main():
     print(f"Mode: {args.mode}")
     print(f"Downsample Factor: {args.downsample_factor}")
     print(f"Number of Targets: {args.num_targets}")
+    print(f"LQR Iterations: {args.lqr_iter}")
     print(f"MPC dt: {0.05 * args.downsample_factor:.2f}s")
     print(f"MPC horizon: {100 // args.downsample_factor} steps")
     
@@ -1386,10 +1400,11 @@ def main():
             num_targets=args.num_targets
         )
         
-        # Create trainer with multiple targets
+        # Create trainer with multiple targets and lqr_iter
         trainer = VehicleLSTMMPCTrainer(model, 
                                       downsample_factor=args.downsample_factor,
-                                      num_targets=args.num_targets)
+                                      num_targets=args.num_targets,
+                                      lqr_iter=args.lqr_iter)
         
         # Train model
         trainer.train_model(
@@ -1404,9 +1419,14 @@ def main():
         # Load test dataset
         test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
-        # Load model
-        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}.pth')
-        predictor = VehicleLSTMMPCPredictor(model_path)
+        # Load model with lqr_iter parameter
+        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}_lqr{args.lqr_iter}.pth')
+        if not os.path.exists(model_path):
+            print(f"Error: Model not found at {model_path}")
+            print("Please train the model first.")
+            return
+            
+        predictor = VehicleLSTMMPCPredictor(model_path, lqr_iter=args.lqr_iter)
         
         # Test samples
         for i in range(0, 10000, 100):
@@ -1471,7 +1491,7 @@ def main():
         test_dataset_full = load_dataset_from_folder(args.data_folder, args.test_file)
         
         # Load model
-        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}.pth')
+        model_path = os.path.join(args.save_dir, f'best_vehicle_lstm_mpc_ds{args.downsample_factor}_targets{args.num_targets}_lqr{args.lqr_iter}.pth')
         if not os.path.exists(model_path):
             print(f"Error: Model not found at {model_path}")
             print("Please train the model first.")
