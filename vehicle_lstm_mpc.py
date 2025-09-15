@@ -200,7 +200,7 @@ class VehicleLSTMMPC(nn.Module):
         # Predict MPC parameters
         state_weights = self.state_weight_head(last_hidden)  # (batch_size, 4)
         control_weights = self.control_weight_head(last_hidden) # (batch_size, 2)
-        
+
         # NEW: Decode targets using LSTM decoder
         target_states, target_controls = self.decode_targets(last_hidden)  # (batch, num_targets, state_dim), (batch, num_targets, control_dim)
         
@@ -325,7 +325,7 @@ class VehicleMPCSolver:
             n_state=self.n_state,
             n_ctrl=self.n_ctrl,
             T=self.mpc_horizon,
-            lqr_iter=10,
+            lqr_iter=30,
             grad_method=GradMethods.ANALYTIC,
             exit_unconverged=False,
             detach_unconverged=False,
@@ -484,15 +484,15 @@ class VehicleLSTMMPCTrainer:
                 control_weights,
                 target
             )
-            
+
             # Downsample ground truth for comparison
             downsampled_indices = torch.arange(
-                0, 
-                min(future_states.size(1), mpc_states.size(1) * self.downsample_factor), 
+                self.downsample_factor - 1, 
+                future_states.size(1),
                 self.downsample_factor,
                 device=self.device
             )
-            
+
             # Ensure we don't exceed MPC prediction length
             downsampled_indices = downsampled_indices[:mpc_states.size(1)]
             
@@ -534,8 +534,8 @@ class VehicleLSTMMPCTrainer:
             control_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
         
         # Parameter regularization
-        state_weight_reg = torch.mean((state_weights - 0.0).pow(2))
-        control_weight_reg = torch.mean((control_weights - 0.0).pow(2))
+        state_weight_reg = torch.mean((state_weights - 1.0).pow(2))
+        control_weight_reg = torch.mean((control_weights - 0.1).pow(2))
         target_reg = torch.mean(target.pow(2)) * 0.0
         
         regularization = state_weight_reg + control_weight_reg + target_reg
@@ -1197,8 +1197,8 @@ def evaluate_full_dataset(predictor, test_dataset_full, device='cpu'):
             )
             
             # Downsample ground truth to match MPC predictions
-            ds_indices = np.arange(0, len(seq['future_states']), predictor.downsample_factor)
-            downsampled_future_states = seq['future_states'][ds_indices[:len(predicted_states)]]
+            ds_indices = np.arange(predictor.downsample_factor - 1, len(seq['future_states']), predictor.downsample_factor)
+            downsampled_future_states = seq['future_states'][ds_indices]
             
             all_pred_states.append(predicted_states)
             all_true_states.append(downsampled_future_states)
@@ -1338,15 +1338,15 @@ def main():
     # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
-    parser.add_argument('--num_targets', type=int, default=5, 
+    parser.add_argument('--num_targets', type=int, default=10, 
                        help='Number of target points to use across MPC horizon')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
-     
+    
     # Run mode
     parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='train',
                        help='Mode: train, test, or evaluate')
@@ -1442,7 +1442,7 @@ def main():
             print(f"  MPC horizon: {mpc_params['mpc_horizon']} steps")
             
             # For comparison, downsample ground truth
-            ds_indices = np.arange(0, len(future_states), predictor.downsample_factor)
+            ds_indices = np.arange(predictor.downsample_factor-1, len(future_states), predictor.downsample_factor)
             downsampled_future_states = future_states[ds_indices[:len(predicted_states)]]
             
             # Use the cost probability heatmap visualization
@@ -1478,7 +1478,7 @@ def main():
             return
             
         predictor = VehicleLSTMMPCPredictor(model_path)
-        
+         
         # Evaluate entire test dataset
         error_results = evaluate_full_dataset(predictor, test_dataset_full)
         

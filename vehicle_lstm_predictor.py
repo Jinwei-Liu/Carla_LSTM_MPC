@@ -551,12 +551,12 @@ def main():
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100, help='Training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='LSTM layers')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='train', 
+    parser.add_argument('--mode', choices=['train', 'test', 'predict', 'evaluate'], default='test', 
                        help='Mode: train, test, predict, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
