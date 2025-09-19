@@ -131,10 +131,10 @@ class Kinematic_Bicycle_MPC(nn.Module):
         # Discretization
         eye = torch.eye(self.s_dim, dtype=X.dtype, device=X.device)
         eye = eye.expand(*batch_shape, -1, -1)
-        A_d = eye + A
-        B_d = B
+        A_d = eye + DT*A
+        B_d = DT*B
 
-        return A_d, B_d
+        return A, B
     
     def get_beta(self, delta_f):
         """Compute side slip angle"""

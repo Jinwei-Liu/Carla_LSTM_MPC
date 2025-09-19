@@ -420,7 +420,7 @@ class VehicleLSTMMPCTrainer:
                 loss.backward()
                 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 optimizer.step()
                 
                 train_loss += loss.item()
@@ -500,13 +500,12 @@ class VehicleLSTMMPCTrainer:
                 self.downsample_factor,
                 device=self.device
             )
-
             # Ensure we don't exceed MPC prediction length
             downsampled_indices = downsampled_indices[:mpc_states.size(1)]
             
             downsampled_future_states = future_states[:, downsampled_indices, :]
             downsampled_future_actions = future_actions[:, downsampled_indices, :]
-            
+
             # Truncate MPC predictions to match downsampled ground truth length
             mpc_states_truncated = mpc_states[:, :len(downsampled_indices), :]
             mpc_controls_truncated = mpc_controls[:, :len(downsampled_indices), :]
@@ -542,9 +541,9 @@ class VehicleLSTMMPCTrainer:
             control_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
         
         # Parameter regularization
-        state_weight_reg = torch.mean((state_weights - 1.0).pow(2))
-        control_weight_reg = torch.mean((control_weights - 0.1).pow(2))
-        target_reg = torch.mean(target.pow(2)) * 0.0
+        state_weight_reg = torch.mean((state_weights).pow(2))
+        control_weight_reg = torch.mean((control_weights).pow(2))
+        target_reg = torch.mean(target.pow(2)) * 0.1
         
         regularization = state_weight_reg + control_weight_reg + target_reg
         
@@ -752,77 +751,138 @@ class VehicleLSTMMPCPredictor:
     
     def _plot_cost_probability_heatmap(self, ax, predicted_states, cost_breakdown):
         """
-        绘制基于cost的概率热力图
-        cost越低的位置，概率权重越高（更"可能"被选中）
+        Draw probability heatmap based on cost
+        The lower the cost, the higher the probability weight (more "likely" to be selected)
         """
         x = predicted_states[:, 0]
         y = predicted_states[:, 1] 
         cost = cost_breakdown['total_cost']
         
-        # 将cost转换为概率权重 (cost越低，权重越高)
-        # 使用softmax的逆向思维：cost越高，概率越低
-        weights = np.exp(-cost / (np.std(cost) + 1e-8))  # 负指数变换
-        weights = weights / np.sum(weights)  # 归一化为概率
+        # Convert cost to probability weights (lower cost = higher weight)
+        # Use inverse exponential transformation: higher cost = lower probability
+        if np.std(cost) > 1e-8:  # If there's variation in cost
+            weights = np.exp(-cost / (np.std(cost) + 1e-8))  # Negative exponential transformation
+        else:  # If all costs are the same, use uniform weights
+            weights = np.ones_like(cost)
         
-        # 创建更精细的网格
+        weights = weights / np.sum(weights)  # Normalize to probability
+        
+        # Create finer grid
         x_min, x_max = np.min(x), np.max(x)
         y_min, y_max = np.min(y), np.max(y)
         
-        # 扩展边界以便更好地显示
+        # Expand boundaries for better display
         x_range = x_max - x_min
         y_range = y_max - y_min
+        
+        # Handle case where trajectory has no spatial variation
+        if x_range < 1e-6:
+            x_range = 1.0  # Set minimum range
+            x_min -= 0.5
+            x_max += 0.5
+        
+        if y_range < 1e-6:
+            y_range = 1.0  # Set minimum range
+            y_min -= 0.5
+            y_max += 0.5
+        
         x_min -= x_range * 0.1
         x_max += x_range * 0.1
         y_min -= y_range * 0.1
         y_max += y_range * 0.1
         
-        # 创建网格
+        # Create grid
         grid_size = 100
         xi = np.linspace(x_min, x_max, grid_size)
         yi = np.linspace(y_min, y_max, grid_size)
         xi_mesh, yi_mesh = np.meshgrid(xi, yi)
         
-        # 计算每个网格点的概率密度
-        # 使用高斯核密度估计的思想
-        sigma = min(x_range, y_range) * 0.05  # 核函数的标准差
+        # Calculate probability density for each grid point
+        # Use Gaussian kernel density estimation
+        sigma = min(x_range, y_range) * 0.05  # Kernel function standard deviation
+        if sigma < 1e-6:  # Prevent sigma from being too small
+            sigma = 0.1
+        
         probability_map = np.zeros((grid_size, grid_size))
         
         for i in range(len(x)):
-            # 计算每个轨迹点对网格的影响
+            # Calculate each trajectory point's influence on the grid
             distances_sq = (xi_mesh - x[i])**2 + (yi_mesh - y[i])**2
             influence = weights[i] * np.exp(-distances_sq / (2 * sigma**2))
             probability_map += influence
         
-        # 归一化概率图
+        # Normalize probability map
         if np.sum(probability_map) > 0:
             probability_map = probability_map / np.sum(probability_map)
+        else:
+            # If all values are zero, create a minimal uniform distribution
+            probability_map = np.ones_like(probability_map) / probability_map.size
         
-        # 绘制概率热力图
-        levels = np.linspace(0, np.max(probability_map), 20)
-        contour = ax.contourf(xi_mesh, yi_mesh, probability_map, levels=levels, 
-                             cmap='YlOrRd', alpha=0.8)
+        # Check if probability map has sufficient variation for contouring
+        prob_min = np.min(probability_map)
+        prob_max = np.max(probability_map)
         
-        # 添加等概率线
-        contour_lines = ax.contour(xi_mesh, yi_mesh, probability_map, levels=8, 
-                                  colors='black', alpha=0.3, linewidths=0.5)
+        if prob_max - prob_min < 1e-10:  # No variation in probability map
+            # Add small artificial variation to enable plotting
+            probability_map += np.random.normal(0, prob_max * 0.01, probability_map.shape)
+            prob_min = np.min(probability_map)
+            prob_max = np.max(probability_map)
         
-        # 绘制轨迹点，大小表示概率权重
-        scatter = ax.scatter(x, y, c=weights, s=weights*1000, cmap='YlOrRd', 
-                            edgecolors='black', linewidth=0.5, alpha=0.7)
+        # Create levels ensuring they are strictly increasing
+        levels = np.linspace(prob_min, prob_max, 20)
         
-        # 绘制轨迹线
-        ax.plot(x, y, 'k--', alpha=0.6, linewidth=1, label='Trajectory')
+        # Ensure levels are strictly increasing and remove duplicates
+        # Method 1: Use np.unique which automatically sorts and removes duplicates
+        levels = np.unique(levels)
         
-        # 添加colorbar
-        cbar = plt.colorbar(contour, ax=ax, shrink=0.8)
-        cbar.set_label('Probability Density', rotation=270, labelpad=15)
+        # Method 2: If we still don't have enough variation, create manual levels
+        if len(levels) < 2 or (levels[-1] - levels[0]) < 1e-10:
+            # Create a small artificial range
+            mid_val = (prob_min + prob_max) / 2
+            range_val = max(1e-8, (prob_max - prob_min))
+            levels = np.array([mid_val - range_val/2, mid_val + range_val/2])
         
-        # 标注高概率区域
-        max_prob_idx = np.unravel_index(np.argmax(probability_map), probability_map.shape)
-        max_prob_x = xi_mesh[max_prob_idx]
-        max_prob_y = yi_mesh[max_prob_idx]
-        ax.plot(max_prob_x, max_prob_y, 'w*', markersize=15, 
-               markeredgecolor='black', markeredgewidth=1, label='Peak Probability')
+        # Ensure we have at least 2 levels and they are different
+        if len(levels) < 2:
+            levels = np.array([prob_min, prob_min + 1e-8])
+        
+        try:
+            # Draw probability heatmap
+            contour = ax.contourf(xi_mesh, yi_mesh, probability_map, levels=levels, 
+                                cmap='YlOrRd', alpha=0.8)
+            
+            # Add iso-probability lines
+            contour_lines = ax.contour(xi_mesh, yi_mesh, probability_map, levels=min(8, len(levels)), 
+                                    colors='black', alpha=0.3, linewidths=0.5)
+            
+            # Draw trajectory points, size represents probability weight
+            scatter = ax.scatter(x, y, c=weights, s=weights*1000, cmap='YlOrRd', 
+                                edgecolors='black', linewidth=0.5, alpha=0.7)
+            
+            # Draw trajectory line
+            ax.plot(x, y, 'k--', alpha=0.6, linewidth=1, label='Trajectory')
+            
+            # Add colorbar
+            cbar = plt.colorbar(contour, ax=ax, shrink=0.8)
+            cbar.set_label('Probability Density', rotation=270, labelpad=15)
+            
+            # Mark high probability region
+            max_prob_idx = np.unravel_index(np.argmax(probability_map), probability_map.shape)
+            max_prob_x = xi_mesh[max_prob_idx]
+            max_prob_y = yi_mesh[max_prob_idx]
+            ax.plot(max_prob_x, max_prob_y, 'w*', markersize=15, 
+                markeredgecolor='black', markeredgewidth=1, label='Peak Probability')
+            
+        except Exception as e:
+            # If contouring still fails, fall back to simple scatter plot
+            print(f"Warning: Contour plotting failed ({e}), using fallback visualization")
+            scatter = ax.scatter(x, y, c=weights, s=weights*500, cmap='YlOrRd', 
+                                edgecolors='black', linewidth=0.5, alpha=0.7)
+            ax.plot(x, y, 'k--', alpha=0.6, linewidth=1, label='Trajectory')
+            
+            # Add colorbar for scatter plot
+            cbar = plt.colorbar(scatter, ax=ax, shrink=0.8)
+            cbar.set_label('Probability Weight', rotation=270, labelpad=15)
         
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
@@ -1183,58 +1243,79 @@ def calculate_temporal_errors(pred_states, true_states, time_step=0.05, downsamp
     
     return error_results
 
-def evaluate_full_dataset(predictor, test_dataset_full, device='cpu'):
-    """Evaluate entire test dataset and compute temporal error statistics"""
-    print("Starting full dataset evaluation...")
+def evaluate_full_dataset(predictor, test_dataset_full, device='cpu', batch_size=128):
+    """Evaluate entire test dataset using batch processing"""
+    print("Starting full dataset evaluation with batch processing...")
     print(f"Total test sequences: {len(test_dataset_full['training_sequences'])}")
+    print(f"Batch size: {batch_size}")
     print(f"Using downsample factor: {predictor.downsample_factor}")
     print(f"Using number of targets: {predictor.num_targets}")
+    
+    # Create dataset and dataloader
+    test_dataset = VehicleLSTMMPCDataset(test_dataset_full['training_sequences'])
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
     all_pred_states = []
     all_true_states = []
     
-    for i, seq in enumerate(tqdm(test_dataset_full['training_sequences'], desc="Processing sequences")):
-        try:
-            # Convert controls to [a, delta_f] format
-            max_accel = 10.0
-            max_steer = np.deg2rad(70)
-            hist_controls = seq['hist_controls']
-            accelerations = (hist_controls[:, 0] - hist_controls[:, 1]) * max_accel
-            steer_angles = hist_controls[:, 2] * max_steer
-            hist_actions = np.column_stack([accelerations, steer_angles])
-            
-            # Predict using LSTM-MPC
-            optimal_controls, predicted_states, mpc_params = predictor.predict_control(
-                seq['hist_states'], hist_actions, seq['current_state']
-            )
-            
-            # Downsample ground truth to match MPC predictions
-            ds_indices = np.arange(predictor.downsample_factor - 1, len(seq['future_states']), predictor.downsample_factor)
-            downsampled_future_states = seq['future_states'][ds_indices]
-            
-            all_pred_states.append(predicted_states)
-            all_true_states.append(downsampled_future_states)
-            
-        except Exception as e:
-            print(f"Error processing sequence {i}: {e}")
-            continue
+    predictor.model.eval()
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Processing batches"):
+            try:
+                # Move batch to device
+                input_seq = batch['input_seq'].to(device)
+                current_state = batch['current_state'].to(device)
+                future_states = batch['future_states'].to(device)
+                
+                # Batch prediction using LSTM
+                state_weights, control_weights, target = predictor.model(input_seq)
+                
+                # Solve MPC for the batch
+                mpc_states, mpc_controls = predictor.mpc_solver.solve(
+                    current_state,
+                    state_weights, 
+                    control_weights,
+                    target
+                )
+                
+                # Downsample ground truth for comparison
+                downsampled_indices = torch.arange(
+                    predictor.downsample_factor - 1,
+                    future_states.size(1),
+                    predictor.downsample_factor,
+                    device=device
+                )
+                downsampled_indices = downsampled_indices[:mpc_states.size(1)]
+                downsampled_future_states = future_states[:, downsampled_indices, :]
+                
+                # Truncate MPC predictions to match
+                mpc_states_truncated = mpc_states[:, :len(downsampled_indices), :]
+                
+                # Store results
+                all_pred_states.append(mpc_states_truncated.cpu().numpy())
+                all_true_states.append(downsampled_future_states.cpu().numpy())
+                    
+            except Exception as e:
+                print(f"Warning: Batch failed: {e}")
+                continue
     
     if not all_pred_states:
         print("No valid predictions generated!")
         return None
     
-    # Convert to numpy arrays and ensure same shape
-    min_length = min(len(pred) for pred in all_pred_states)
-    all_pred_states = np.array([pred[:min_length] for pred in all_pred_states])
-    all_true_states = np.array([true[:min_length] for true in all_true_states])
+    # Concatenate all batches
+    all_pred_states = np.concatenate(all_pred_states, axis=0)
+    all_true_states = np.concatenate(all_true_states, axis=0)
     
     print(f"Successfully processed {len(all_pred_states)} sequences")
-    print(f"Prediction horizon: {min_length} steps (MPC dt = {predictor.mpc_solver.mpc_dt}s)")
+    print(f"Prediction horizon: {all_pred_states.shape[1]} steps (MPC dt = {predictor.mpc_solver.mpc_dt}s)")
     
+    # Calculate temporal errors
     temporal_errors = calculate_temporal_errors(
-        all_pred_states, all_true_states, 
+        all_pred_states, all_true_states,
         time_step=predictor.mpc_solver.mpc_dt,
-        downsample_factor=1  # Already handled in MPC solver
+        downsample_factor=1
     )
     
     return temporal_errors
@@ -1349,9 +1430,9 @@ def main():
     # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
-    parser.add_argument('--num_targets', type=int, default=10, 
+    parser.add_argument('--num_targets', type=int, default=5, 
                        help='Number of target points to use across MPC horizon')
-    parser.add_argument('--lqr_iter', type=int, default=30,
+    parser.add_argument('--lqr_iter', type=int, default=5,
                        help='Number of LQR iterations for MPC solver (default: 30)')
     
     # Training parameters
@@ -1361,7 +1442,7 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='train',
+    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='test',
                        help='Mode: train, test, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
