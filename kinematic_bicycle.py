@@ -88,10 +88,10 @@ class Kinematic_Bicycle_MPC(nn.Module):
         return dstate
     
     def grad_input(self, X, action):
-        """Compute Jacobian matrices A and B for linearization"""
-        # 同样需要限制动作范围，保证雅可比矩阵计算的一致性
+        """计算状态转移矩阵，使得 X_next = A_d @ X + B_d @ u
+        这是一个时变线性系统，每个时间步都要重新计算
+        """
         action_clipped = self.clip_action(action)
-        
         DT = self._dt
         batch_shape = X.shape[:-1]
         
@@ -99,42 +99,85 @@ class Kinematic_Bicycle_MPC(nn.Module):
         v = X[..., 3] 
         
         a, delta_f = action_clipped.split(1, dim=-1)
+        a = a.squeeze(-1)
         delta_f = delta_f.squeeze(-1)
         
-        # Side slip angle and its derivative
+        # 计算侧滑角 β (只与控制输入 δf 有关)
         tan_delta = torch.tan(delta_f)
         beta = torch.atan((self._lr / (self._lf + self._lr)) * tan_delta)
         
-        coeff = self._lr / (self._lf + self._lr)
-        sec2_delta = 1.0 / (torch.cos(delta_f) ** 2)
-        dbeta_ddelta = coeff * sec2_delta / (1.0 + (coeff * tan_delta) ** 2)
-        
-        A = X.new_zeros(*batch_shape, self.s_dim, self.s_dim)
-        B = X.new_zeros(*batch_shape, self.s_dim, self.a_dim)
-        
+        cos_psi = torch.cos(psi)
+        sin_psi = torch.sin(psi)
+        cos_beta = torch.cos(beta)
+        sin_beta = torch.sin(beta)
         cos_psi_beta = torch.cos(psi + beta)
         sin_psi_beta = torch.sin(psi + beta)
         
-        # A matrix
-        A[..., 0, 2] = -v * sin_psi_beta  # dx/dpsi
-        A[..., 0, 3] = cos_psi_beta       # dx/dv 
-        A[..., 1, 2] = v * cos_psi_beta   # dy/dpsi
-        A[..., 1, 3] = sin_psi_beta       # dy/dv 
-        A[..., 2, 3] = (1.0 / self._L) * torch.sin(beta)  # dpsi/dv 
+        # 初始化矩阵
+        A_d = X.new_zeros(*batch_shape, self.s_dim, self.s_dim)
+        B_d = X.new_zeros(*batch_shape, self.s_dim, self.a_dim)
+        C_d = X.new_zeros(*batch_shape, self.s_dim)  # 常数项
         
-        # B matrix 
-        B[..., 0, 1] = -v * sin_psi_beta * dbeta_ddelta  # dx/ddelta_f
-        B[..., 1, 1] = v * cos_psi_beta * dbeta_ddelta   # dy/ddelta_f
-        B[..., 2, 1] = (v / self._L) * torch.cos(beta) * dbeta_ddelta  # dpsi/ddelta_f
-        B[..., 3, 0] = 1.0  # dv/da
+        # 构造状态转移矩阵
+        # x_next = x + dt * v * cos(ψ + β)
+        # 注意：cos(ψ + β) 不能分解为关于 x,y,ψ,v 的线性组合
+        # 但我们可以在给定当前 ψ 和 β 的情况下线性化
         
-        # Discretization
-        eye = torch.eye(self.s_dim, dtype=X.dtype, device=X.device)
-        eye = eye.expand(*batch_shape, -1, -1)
-        A_d = eye + DT*A
-        B_d = DT*B
-
-        return A, B
+        # 对于 x 方程：x_next = x + dt * v * cos(ψ + β)
+        # 其中 ψ 和 β 在当前时刻是已知的常数
+        A_d[..., 0, 0] = 1.0                      # ∂x_next/∂x
+        A_d[..., 0, 1] = 0.0                      # ∂x_next/∂y
+        A_d[..., 0, 2] = 0.0                      # ∂x_next/∂ψ (线性化后为0)
+        A_d[..., 0, 3] = DT * cos_psi_beta        # ∂x_next/∂v
+        
+        # 对于 y 方程：y_next = y + dt * v * sin(ψ + β)
+        A_d[..., 1, 0] = 0.0                      # ∂y_next/∂x
+        A_d[..., 1, 1] = 1.0                      # ∂y_next/∂y
+        A_d[..., 1, 2] = 0.0                      # ∂y_next/∂ψ (线性化后为0)
+        A_d[..., 1, 3] = DT * sin_psi_beta        # ∂y_next/∂v
+        
+        # 对于 ψ 方程：ψ_next = ψ + dt * (v/L) * sin(β)
+        A_d[..., 2, 0] = 0.0                      # ∂ψ_next/∂x
+        A_d[..., 2, 1] = 0.0                      # ∂ψ_next/∂y
+        A_d[..., 2, 2] = 1.0                      # ∂ψ_next/∂ψ
+        A_d[..., 2, 3] = DT * sin_beta / self._L  # ∂ψ_next/∂v
+        
+        # 对于 v 方程：v_next = v + dt * a
+        A_d[..., 3, 0] = 0.0                      # ∂v_next/∂x
+        A_d[..., 3, 1] = 0.0                      # ∂v_next/∂y
+        A_d[..., 3, 2] = 0.0                      # ∂v_next/∂ψ
+        A_d[..., 3, 3] = 1.0                      # ∂v_next/∂v
+        
+        # 控制矩阵 B_d
+        # 注意：由于 β 依赖于 δf，所有包含 β 的项都会受影响
+        
+        # 由于 x_next = x + dt * v * cos(ψ + β(δf))
+        # 我们需要把 β 的影响放入 B_d 中
+        # 但这很复杂，因为 β 是 δf 的非线性函数
+        
+        # 简化方案：将控制输入的影响直接编码
+        # 对于加速度 a 的影响
+        B_d[..., 0, 0] = 0.0  # x 不直接依赖 a
+        B_d[..., 1, 0] = 0.0  # y 不直接依赖 a
+        B_d[..., 2, 0] = 0.0  # ψ 不直接依赖 a
+        B_d[..., 3, 0] = DT    # v_next = v + dt * a
+        
+        # 对于转向角 δf 的影响（通过 β）
+        # 这里需要计算 ∂β/∂δf
+        coeff = self._lr / (self._lf + self._lr)
+        sec2_delta = 1.0 / (torch.cos(delta_f) ** 2 + 1e-8)
+        dbeta_ddelta = coeff * sec2_delta / (1.0 + (coeff * tan_delta) ** 2 + 1e-8)
+        
+        # x 通过 β 受 δf 影响
+        B_d[..., 0, 1] = -DT * v * sin_psi_beta * dbeta_ddelta
+        # y 通过 β 受 δf 影响
+        B_d[..., 1, 1] = DT * v * cos_psi_beta * dbeta_ddelta
+        # ψ 通过 β 受 δf 影响
+        B_d[..., 2, 1] = DT * v * cos_beta * dbeta_ddelta / self._L
+        # v 不受 δf 影响
+        B_d[..., 3, 1] = 0.0
+        
+        return A_d, B_d
     
     def get_beta(self, delta_f):
         """Compute side slip angle"""

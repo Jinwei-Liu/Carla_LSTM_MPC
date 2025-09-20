@@ -652,7 +652,7 @@ class VehicleLSTMMPCPredictor:
         with torch.no_grad():
             # Predict MPC parameters
             state_weights, control_weights, target = self.model(input_seq)
-            
+
             # Solve MPC
             predicted_states, optimal_controls = self.mpc_solver.solve(
                 current_state, state_weights, control_weights, target
@@ -1424,13 +1424,13 @@ def main():
     
     # Model parameters
     parser.add_argument('--save_dir', default='models', help='Model save directory')
-    parser.add_argument('--hidden_dim', type=int, default=128, help='LSTM hidden dimension')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='LSTM hidden dimension')
     parser.add_argument('--num_layers', type=int, default=1, help='Number of LSTM layers')
     
     # MPC parameters
     parser.add_argument('--downsample_factor', type=int, default=10, 
                        help='Downsample factor for MPC (e.g., 2 means MPC dt = 0.1s)')
-    parser.add_argument('--num_targets', type=int, default=5, 
+    parser.add_argument('--num_targets', type=int, default=10, 
                        help='Number of target points to use across MPC horizon')
     parser.add_argument('--lqr_iter', type=int, default=5,
                        help='Number of LQR iterations for MPC solver (default: 30)')
@@ -1442,7 +1442,7 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
     
     # Run mode
-    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='test',
+    parser.add_argument('--mode', choices=['train', 'test', 'evaluate'], default='evaluate',
                        help='Mode: train, test, or evaluate')
     parser.add_argument('--save_results', action='store_true', help='Save error results to file')
     
