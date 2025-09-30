@@ -11,7 +11,7 @@ class MapInspector:
         self.world = None
         self.world_map = None
         
-    def connect_and_load_map(self, map_name='Town04'):
+    def connect_and_load_map(self, map_name='Town05'):
         """Connect and load map"""
         try:
             self.world = self.client.get_world()
@@ -225,7 +225,7 @@ def main():
     inspector = MapInspector()
     
     # Connect to map
-    if not inspector.connect_and_load_map('Town04'):
+    if not inspector.connect_and_load_map('Town05'):
         return
     
     # Check all spawn points

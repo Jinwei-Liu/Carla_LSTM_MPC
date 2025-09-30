@@ -110,29 +110,34 @@ class StraightRoadDataCollector:
         self.start_transform = spawn_points[start_index]
         
         # 计算终点位置
-        route_distance = straight_config['route_distance']
-        self.end_location = self._calculate_end_point(self.start_transform, route_distance)
+        end_coords = straight_config.get('end_location_coords')
+        
+        if end_coords and all(k in end_coords for k in ['x', 'y', 'z']):
+            # 如果配置了坐标，直接创建 carla.Location 对象
+            self.end_location = carla.Location(x=end_coords['x'], y=end_coords['y'], z=end_coords['z'])
+            print("路线设置: 使用配置文件中的指定终点。")
+            route_distance = self.start_transform.location.distance(self.end_location)
         
         print(f"路线设置:")
         print(f"  起点: ({self.start_transform.location.x:.1f}, {self.start_transform.location.y:.1f}, {self.start_transform.location.z:.1f})")
         print(f"  终点: ({self.end_location.x:.1f}, {self.end_location.y:.1f}, {self.end_location.z:.1f})")
         print(f"  距离: {route_distance}m")
     
-    def _calculate_end_point(self, start_transform, distance):
-        """计算终点位置"""
-        start_waypoint = self.world.get_map().get_waypoint(start_transform.location)
-        current_waypoint = start_waypoint
-        accumulated_distance = 0.0
-        step_size = 5.0
+    # def _calculate_end_point(self, start_transform, distance):
+    #     """计算终点位置"""
+    #     start_waypoint = self.world.get_map().get_waypoint(start_transform.location)
+    #     current_waypoint = start_waypoint
+    #     accumulated_distance = 0.0
+    #     step_size = 5.0
         
-        while accumulated_distance < distance:
-            next_waypoints = current_waypoint.next(step_size)
-            if not next_waypoints:
-                break
-            current_waypoint = next_waypoints[0]
-            accumulated_distance += step_size
+    #     while accumulated_distance < distance:
+    #         next_waypoints = current_waypoint.next(step_size)
+    #         if not next_waypoints:
+    #             break
+    #         current_waypoint = next_waypoints[0]
+    #         accumulated_distance += step_size
         
-        return current_waypoint.transform.location
+    #     return current_waypoint.transform.location
     
     def _spawn_ego_vehicle(self):
         """生成主控车辆"""
@@ -171,49 +176,49 @@ class StraightRoadDataCollector:
         # 获取主车起始路点
         ego_waypoint = world_map.get_waypoint(self.start_transform.location)
         
-        # 1. 首先生成前方静止障碍车辆（固定）
-        try:
-            # 在前方30-60米随机位置生成静止车辆
-            distance_ahead = random.uniform(30, 60)
+        # # 1. 首先生成前方静止障碍车辆（固定）
+        # try:
+        #     # 在前方10-20米随机位置生成静止车辆
+        #     distance_ahead = random.uniform(10, 20)
             
-            # 计算位置
-            current_waypoint = ego_waypoint
-            accumulated_distance = 0.0
+        #     # 计算位置
+        #     current_waypoint = ego_waypoint
+        #     accumulated_distance = 0.0
             
-            while accumulated_distance < distance_ahead:
-                next_waypoints = current_waypoint.next(2.0)
-                if not next_waypoints:
-                    break
-                current_waypoint = next_waypoints[0]
-                accumulated_distance += 2.0
+        #     while accumulated_distance < distance_ahead:
+        #         next_waypoints = current_waypoint.next(2.0)
+        #         if not next_waypoints:
+        #             break
+        #         current_waypoint = next_waypoints[0]
+        #         accumulated_distance += 2.0
             
-            # 生成静止车辆（使用大众T2面包车作为障碍）
-            static_vehicle_bp = bp_library.filter('vehicle.volkswagen.t2')[0]
-            if static_vehicle_bp.has_attribute('color'):
-                static_vehicle_bp.set_attribute('color', '255,0,0')  # 红色
+        #     # 生成静止车辆（使用大众T2面包车作为障碍）
+        #     static_vehicle_bp = bp_library.filter('vehicle.volkswagen.t2')[0]
+        #     if static_vehicle_bp.has_attribute('color'):
+        #         static_vehicle_bp.set_attribute('color', '255,0,0')  # 红色
             
-            spawn_transform = current_waypoint.transform
-            spawn_transform.location.z += 0.5
+        #     spawn_transform = current_waypoint.transform
+        #     spawn_transform.location.z += 0.5
             
-            static_vehicle = self.world.spawn_actor(static_vehicle_bp, spawn_transform)
+        #     static_vehicle = self.world.spawn_actor(static_vehicle_bp, spawn_transform)
             
-            # 设置为静止（手刹拉起）
-            static_control = carla.VehicleControl()
-            static_control.hand_brake = True
-            static_control.throttle = 0.0
-            static_control.brake = 1.0
-            static_vehicle.apply_control(static_control)
+        #     # 设置为静止（手刹拉起）
+        #     static_control = carla.VehicleControl()
+        #     static_control.hand_brake = True
+        #     static_control.throttle = 0.0
+        #     static_control.brake = 1.0
+        #     static_vehicle.apply_control(static_control)
             
-            self.ai_vehicles.append({
-                'actor': static_vehicle,
-                'config': {'model': 'static_obstacle', 'distance_ahead': distance_ahead},
-                'spawn_transform': spawn_transform
-            })
+        #     self.ai_vehicles.append({
+        #         'actor': static_vehicle,
+        #         'config': {'model': 'static_obstacle', 'distance_ahead': distance_ahead},
+        #         'spawn_transform': spawn_transform
+        #     })
             
-            print(f"✓ 前方静止障碍车辆生成完成，距离: {distance_ahead:.1f}米")
+        #     print(f"✓ 前方静止障碍车辆生成完成，距离: {distance_ahead:.1f}米")
             
-        except Exception as e:
-            print(f"生成前方静止车辆失败: {e}")
+        # except Exception as e:
+        #     print(f"生成前方静止车辆失败: {e}")
         
         # 2. 根据config生成随机交通车辆
         random_traffic_config = config.STRAIGHT_ROAD_CONFIG.get('random_traffic', {})
@@ -351,54 +356,54 @@ class StraightRoadDataCollector:
         # 更新AI车辆列表（保留自动驾驶车辆）
         self.ai_vehicles = other_vehicles
         
-        # 3. 重新生成前方静止障碍车
-        try:
-            bp_library = self.world.get_blueprint_library()
-            world_map = self.world.get_map()
-            ego_waypoint = world_map.get_waypoint(self.start_transform.location)
+        # # 3. 重新生成前方静止障碍车
+        # try:
+        #     bp_library = self.world.get_blueprint_library()
+        #     world_map = self.world.get_map()
+        #     ego_waypoint = world_map.get_waypoint(self.start_transform.location)
             
-            # 在前方30-60米随机位置生成静止车辆
-            distance_ahead = random.uniform(30, 60)
+        #     # 在前方30-60米随机位置生成静止车辆
+        #     distance_ahead = random.uniform(30, 60)
             
-            # 计算位置
-            current_waypoint = ego_waypoint
-            accumulated_distance = 0.0
+        #     # 计算位置
+        #     current_waypoint = ego_waypoint
+        #     accumulated_distance = 0.0
             
-            while accumulated_distance < distance_ahead:
-                next_waypoints = current_waypoint.next(2.0)
-                if not next_waypoints:
-                    break
-                current_waypoint = next_waypoints[0]
-                accumulated_distance += 2.0
+        #     while accumulated_distance < distance_ahead:
+        #         next_waypoints = current_waypoint.next(2.0)
+        #         if not next_waypoints:
+        #             break
+        #         current_waypoint = next_waypoints[0]
+        #         accumulated_distance += 2.0
             
-            # 生成静止车辆（使用大众T2面包车作为障碍）
-            static_vehicle_bp = bp_library.filter('vehicle.volkswagen.t2')[0]
-            if static_vehicle_bp.has_attribute('color'):
-                static_vehicle_bp.set_attribute('color', '255,0,0')  # 红色
+        #     # 生成静止车辆（使用大众T2面包车作为障碍）
+        #     static_vehicle_bp = bp_library.filter('vehicle.volkswagen.t2')[0]
+        #     if static_vehicle_bp.has_attribute('color'):
+        #         static_vehicle_bp.set_attribute('color', '255,0,0')  # 红色
             
-            spawn_transform = current_waypoint.transform
-            spawn_transform.location.z += 0.5
+        #     spawn_transform = current_waypoint.transform
+        #     spawn_transform.location.z += 0.5
             
-            static_vehicle = self.world.spawn_actor(static_vehicle_bp, spawn_transform)
+        #     static_vehicle = self.world.spawn_actor(static_vehicle_bp, spawn_transform)
             
-            # 设置为静止（手刹拉起）
-            static_control = carla.VehicleControl()
-            static_control.hand_brake = True
-            static_control.throttle = 0.0
-            static_control.brake = 1.0
-            static_vehicle.apply_control(static_control)
+        #     # 设置为静止（手刹拉起）
+        #     static_control = carla.VehicleControl()
+        #     static_control.hand_brake = True
+        #     static_control.throttle = 0.0
+        #     static_control.brake = 1.0
+        #     static_vehicle.apply_control(static_control)
             
-            self.ai_vehicles.append({
-                'actor': static_vehicle,
-                'config': {'model': 'static_obstacle', 'distance_ahead': distance_ahead},
-                'spawn_transform': spawn_transform
-            })
+        #     self.ai_vehicles.append({
+        #         'actor': static_vehicle,
+        #         'config': {'model': 'static_obstacle', 'distance_ahead': distance_ahead},
+        #         'spawn_transform': spawn_transform
+        #     })
             
-            print(f"[重置] 新静止障碍车生成完成，距离: {distance_ahead:.1f}米")
-            print(f"[重置] 保留 {len(other_vehicles)} 辆自动驾驶车辆继续运行")
+        #     print(f"[重置] 新静止障碍车生成完成，距离: {distance_ahead:.1f}米")
+        #     print(f"[重置] 保留 {len(other_vehicles)} 辆自动驾驶车辆继续运行")
             
-        except Exception as e:
-            print(f"[重置] 生成静止障碍车失败: {e}")
+        # except Exception as e:
+        #     print(f"[重置] 生成静止障碍车失败: {e}")
         
         # 短暂等待
         time.sleep(1.0)
@@ -542,7 +547,6 @@ class StraightRoadDataCollector:
             print("\n" + "="*50)
             print("数据收集已开始！")
             print("使用方向盘控制车辆，到达终点自动重置")
-            print(f"目标距离: {config.STRAIGHT_ROAD_CONFIG['route_distance']:.0f}m")
             print(f"完成判定距离: {config.STRAIGHT_ROAD_CONFIG['completion_distance']:.0f}m")
             print("="*50 + "\n")
             

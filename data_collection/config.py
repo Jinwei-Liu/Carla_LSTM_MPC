@@ -8,7 +8,7 @@ CARLA_PORT = 2000
 TIMEOUT = 30.0
 
 # 地图和天气
-MAP_NAME = 'Town04'  # Town04有很好的高速公路直道
+MAP_NAME = 'Town02' 
 WEATHER_PRESET = 'ClearNoon'
 
 # 车辆配置
@@ -17,13 +17,13 @@ VEHICLE_MODEL = 'vehicle.tesla.model3'
 # 直道变道环境配置（优化版）
 STRAIGHT_ROAD_CONFIG = {
     # 使用spawn point索引
-    'start_spawn_index': 349,      # 使用测试验证的生成点349
-    'route_distance': 400.0,       # 路线长度 (米)
-    'completion_distance': 30.0,   # 到达终点的判定距离
+    'start_spawn_index': 73,      # 使用测试验证的生成点349
+    'end_location_coords': {'x': 132.0, 'y': 201.0, 'z': 0.0},
+    'completion_distance': 10.0,   # 到达终点的判定距离
     
     # 随机交通配置 - 调整数量避免过多车辆
     'random_traffic': {
-        'num_vehicles': 30,        # 减少随机交通车辆数量（避免卡顿）
+        'num_vehicles': 10,        # 减少随机交通车辆数量（避免卡顿）
         'spawn_radius': 2000,       # 生成半径（米）
         'preserve_on_reset': True, # 重置时保留随机交通车辆
     }
@@ -32,7 +32,7 @@ STRAIGHT_ROAD_CONFIG = {
 # 数据收集配置
 COLLECT_FREQUENCY = 20  # Hz
 EPISODE_LENGTH = 300    # 秒 (增加到5分钟，给更多时间完成)
-TRAFFIC_VEHICLES = 30   # 随机交通车辆数量（与上面保持一致）
+TRAFFIC_VEHICLES = 10   # 随机交通车辆数量（与上面保持一致）
 TRAFFIC_PEDESTRIANS = 0  # 不生成行人
 
 # 数据保存选项
@@ -101,7 +101,6 @@ RESET_CONFIG = {
     'reset_ego_vehicle': True,          # 重置主车位置
     'reset_static_obstacle': True,      # 重置静止障碍车
     'reset_random_traffic': False,      # 不重置随机交通（让它们继续跑）
-    'static_obstacle_distance_range': (30, 60),  # 静止障碍车距离范围
 }
 
 # 性能优化配置
